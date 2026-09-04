@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+
+# attic/ holds the one-shot scripts that translated this tree into English. They did their
+# job, their line number maps no longer match the files, and they were the only files the
+# language gate had to exempt, which made them a permanent blind spot. They are kept out
+# of the repository and out of the pack, not deleted: the first commit still has them.
+attic/

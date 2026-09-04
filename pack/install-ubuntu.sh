@@ -25,9 +25,9 @@ fi
 
 echo "=== space"
 df -h "$EWS_WORK" | tail -1
-libres_gb=$(( $(df -Pk "$EWS_WORK" | awk 'NR==2 {print $4}') / 1024 / 1024 ))
-if [ "$libres_gb" -lt 3 ]; then
-    echo "STOP: $libres_gb GB free, the disk image alone grows past 260 MB and the"
+free_gb=$(( $(df -Pk "$EWS_WORK" | awk 'NR==2 {print $4}') / 1024 / 1024 ))
+if [ "$free_gb" -lt 3 ]; then
+    echo "STOP: $free_gb GB free, the disk image alone grows past 260 MB and the"
     echo "installer needs room to work."
     exit 1
 fi

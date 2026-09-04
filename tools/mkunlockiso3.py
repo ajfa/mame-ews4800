@@ -68,12 +68,12 @@ def find_iso_file(raw, want):
     for path, lba, ln, flags in iso_walk(raw, rl, rs):
         if path == want:
             return lba * SECTOR, ln
-    sys.exit('no encontre %s en el ISO' % want)
+    sys.exit('could not find %s in the ISO' % want)
 
 
 def pad_to(body, n):
     if len(body) > n:
-        sys.exit('el reemplazo no cabe: %d > %d' % (len(body), n))
+        sys.exit('the replacement does not fit: %d > %d' % (len(body), n))
     out, pad = [body], n - len(body)
     while pad > 0:
         if pad == 1:
@@ -91,19 +91,19 @@ def main():
     iso_in, iso_out = sys.argv[1], sys.argv[2]
     marker = '--marker' in sys.argv
     if os.path.exists(iso_out):
-        sys.exit('ya existe %s -- no lo piso' % iso_out)
-    print('copiando %s -> %s' % (iso_in, iso_out))
+        sys.exit('%s already exists, not overwriting it' % iso_out)
+    print('copying %s -> %s' % (iso_in, iso_out))
     shutil.copyfile(iso_in, iso_out)
 
     with open(iso_out, 'r+b') as f:
         raw = f.read()
 
-        # ---- 1) el instalador de FMLI, que vive PLANO en el ISO -------------
+        # ---- 1) the FMLI installer, which lives FLAT in the ISO -------------
         base, ln = find_iso_file(raw, CDPROC)
         data = bytearray(raw[base:base + ln])
         i0 = data.index(START)
         i1 = data.index(END, i0) + len(END)
-        print('instproccdrom: LBA byte %d, tramo %d..%d (%d bytes)'
+        print('instproccdrom: LBA byte %d, span %d..%d (%d bytes)'
               % (base, i0, i1, i1 - i0))
         rep = pad_to(LINE, i1 - i0)
         f.seek(base + i0)
@@ -120,20 +120,20 @@ def main():
                 f.write(mnew)
                 n += 1
                 j = data.find(mold, j + 1)
-            print('marca puesta en %d sitios' % n)
+            print('marker written in %d places' % n)
 
-    # ---- verificacion independiente -------------------------------------
+    # ---- independent verification ----------------------------------------
     raw = open(iso_out, 'rb').read()
     base, ln = find_iso_file(raw, CDPROC)
     d = raw[base:base + ln]
     k = d.index(b'UnlockCheck()')
     print('\n--- UnlockCheck of the FMLI installer, in the output ISO ---')
     print(d[k:k + 200].decode('latin1'))
-    print('  tamano: %d (debe seguir siendo 66474)' % ln)
+    print('  size: %d (must still be 66474)' % ln)
 
-    # y que RAMFILSY sigue intacto y legible
+    # and that RAMFILSY is still intact and readable
     fs = Ufs(raw[RAMFILSY_LBA * SECTOR:RAMFILSY_LBA * SECTOR + RAMFILSY_SIZE])
-    print('  RAMFILSY sigue montable: /inst/etc/instproc = %d bytes'
+    print('  RAMFILSY still mountable: /inst/etc/instproc = %d bytes'
           % len(fs.read(fs.lookup('/inst/etc/instproc'))))
 
 

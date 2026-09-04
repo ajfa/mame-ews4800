@@ -2,11 +2,11 @@
 """Reader for the big endian UFS of RAMFILSY, SVR4 on MIPS.
 
 Nothing has to be mounted: the super block sits at 0x2000, magic 0x00011954
-en +0x55C, y los inodos son los de UFS1 (tamano en +8, bloques directos en +40).
-Las entradas de directorio llevan namlen de 16 bits (SVR4), no el u8+tipo de BSD.
+at +0x55C, and the inodes are UFS1: size at +8, direct blocks at +40.
+Directory entries carry a 16 bit namlen (SVR4), not the u8 plus type of BSD.
 
-Uso:
-  ufsls.py <img> [ruta]                lista un directorio (por defecto /)
+Usage:
+  ufsls.py <img> [path]                lists a directory, / by default
   ufsls.py <img> --cat <path>          writes the file to standard output
   ufsls.py <img> --map <path>          says at which offsets IN THE IMAGE each
                                        block of the file lives
@@ -21,7 +21,7 @@ class Ufs:
     def __init__(self, raw, sb=0x2000):
         self.raw = raw
         u = lambda o: struct.unpack_from('>i', raw, sb + o)[0]
-        assert struct.unpack_from('>I', raw, sb + 0x55c)[0] == 0x11954, 'no es UFS'
+        assert struct.unpack_from('>I', raw, sb + 0x55c)[0] == 0x11954, 'not UFS'
         self.iblkno, self.bsize, self.fsize = u(16), u(48), u(52)
         self.frag, self.cgoffset, self.cgmask = u(56), u(24), u(28)
         self.fpg, self.ipg, self.ncg = u(188), u(184), u(44)
@@ -101,7 +101,7 @@ class Ufs:
                     ino = i
                     break
             else:
-                raise KeyError(path + '  (falla en "%s")' % part)
+                raise KeyError(path + '  (fails at "%s")' % part)
         return ino
 
     def walk(self, ino=2, prefix=''):
@@ -124,9 +124,9 @@ def main():
     elif a and a[0] == '--map':
         ino = fs.lookup(a[1])
         blks, size = fs.blocks(ino)
-        print('%s  inodo %d  %d bytes' % (a[1], ino, size))
+        print('%s  inode %d  %d bytes' % (a[1], ino, size))
         for o, n in blks:
-            print('   imagen 0x%08x  %d bytes' % (o, n) if o else '   HUECO %d' % n)
+            print('   image 0x%08x  %d bytes' % (o, n) if o else '   HOLE %d' % n)
     elif a and a[0] == '--grep':
         pats = [p.encode('latin1').decode('unicode_escape').encode('latin1')
                 for p in a[1:]]

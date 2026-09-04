@@ -22,7 +22,7 @@ def main():
     hits = []
     i = 0
     while True:
-        i = buf.find(b'ELF', i)
+        i = buf.find(b'\x7fELF', i)
         if i < 0:
             break
         hits.append(start + i)

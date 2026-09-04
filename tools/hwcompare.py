@@ -80,7 +80,7 @@ def text_segs(raw):
         if name not in ('.text', '.init', '.fini'):
             continue
         out.append((addr, raw[off:off + size]))
-    if not out:                                    # fallback: todo PROGBITS
+    if not out:                                    # fallback: every PROGBITS
         for name, addr, off, size, typ in sections(raw):
             if typ == 1 and addr and size:
                 out.append((addr, raw[off:off + size]))
@@ -140,9 +140,9 @@ def main():
             hits = scan_io(raw)
             win = {}
             for va, phys in hits:
-                k = phys & 0xFFF00000            # ventana de 1 MB
+                k = phys & 0xFFF00000            # 1 MB window
                 win.setdefault(k, []).append(va)
-            print(f'  -- mapa de I/O ({len(hits)} lui de dispositivo, '
+            print(f'  -- I/O map ({len(hits)} device lui, '
                   f'{len(win)} windows of 1MB) --')
             for k in sorted(win):
                 vas = win[k]
@@ -152,7 +152,7 @@ def main():
 
         if mode in ('--all', '--gfx'):
             g = sorted({s[0] for s in syms if GFX_RE.search(s[0])})
-            print(f'  -- simbolos de grafico/consola/teclado ({len(g)}) --')
+            print(f'  -- graphics, console and keyboard symbols ({len(g)}) --')
             for i in range(0, len(g), 6):
                 print('     ' + '  '.join(f'{x:<20}' for x in g[i:i + 6]))
 

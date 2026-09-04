@@ -41,42 +41,42 @@ end
 -- reaching the bus, so a watchpoint never sees a 0x8 or 0xA address. KSEG0 and
 -- KSEG1 are the SAME physical address here, and that is the only one that fires:
 --     gatype  -> 0x2bd02c        buzzer -> 0x2bd05c
--- (Poner el watchpoint en 0x802bd05c fue el error de la tanda anterior: esa
--- nobody touches the physical one, so "it never fires" was a fault of the
--- instrument, not of the machine.)
+-- (Putting the watchpoint at 0x802bd05c was the previous round's mistake: that is
+-- the VIRTUAL address, and nobody touches the physical one, so "it never fires"
+-- was a fault of the instrument, not of the machine.)
 --
 -- They cost about 3x in speed because the field lives in main RAM and force
 -- every write to be checked, so they are ARMED LATE: EWS_BZWATCH_AT, default
 -- 9000, already measured with buzz=0, leaves the boot running at full speed.
 mk("bz")
 _G.bzwatch_at = tonumber(os.getenv("EWS_BZWATCH_AT") or "9000")
-_G.bzwatch_on = os.getenv("EWS_BZWATCH") ~= "1"   -- true = ya no hay que armar
+_G.bzwatch_on = os.getenv("EWS_BZWATCH") ~= "1"   -- true = nothing left to arm
 
 local function arm_bzwatch()
     -- wpset takes the CONDITION before the action:
-    --      wpset <dir>,<long>,<tipo>[,<condicion>[,<accion>]]
-    -- Sin el "1," de la condicion, MAME se come la accion COMO condicion y el
+    --      wpset <addr>,<len>,<type>[,<condition>[,<action>]]
+    -- Without the "1," condition MAME reads the action AS the condition, and
     -- the watchpoint is installed but silent, which is what used to happen.
     dbg:command("wpset 2bd02c,4,w,1,{trace >>" .. DIR ..
         "/bz.log,0,noloop; tracelog \"GATYPE  pc=%08X val=%08X\\n\",pc,wpdata; trace off; g}")
     dbg:command("wpset 2bd05c,4,w,1,{trace >>" .. DIR ..
         "/bz.log,0,noloop; tracelog \"BUZPTR  pc=%08X val=%08X\\n\",pc,wpdata; trace off; g}")
     local h = io.open(DIR .. "/bz.log", "a")
-    if h then h:write(string.format("[armados en el frame %d]\n", _G.frames or 0)); h:close() end
+    if h then h:write(string.format("[armed at frame %d]\n", _G.frames or 0)); h:close() end
 end
 
 -- EWS_BZTRAP=1: instead of waiting for someone to WRITE the field, watch
 -- what the buzzer routine itself READS, exactly where it blows up.
---   80029904  lw t0,-31232(gp)   ; t0 = bcon (el puntero al softc)
+--   80029904  lw t0,-31232(gp)   ; t0 = bcon (the pointer to the softc)
 --   80029908  lw t1,100(t0)      ; t1 = softc[0x64]  <- the one that reads FF000000
 --   80029910  sh zero,0(t1)      ; fails here, in the delay slot
 -- Registered through MEMORY EXPRESSIONS (d@, which the debugger treats as
 -- virtual) rather than register names, so it does not depend on how MAME
 -- names t0 and t1 on MIPS3. A breakpoint costs nothing until it fires.
 if os.getenv("EWS_BZTRAP") == "1" then
-    -- NOT NESTED: MAME misparses d@(d@X+N), it returned 0C0AB5F0 for gatype, which
-    -- is a word of code). Since bcon is CONSTANT and already measured
-    -- (0x802bcff8 = bcon_vs), the fields are read at literal addresses:
+    -- NOT NESTED: MAME misparses d@(d@X+N). It returned 0C0AB5F0 for gatype, which
+    -- is not a field value but a word of code. Since bcon is CONSTANT and already
+    -- measured (0x802bcff8 = bcon_vs), the fields are read at literal addresses:
     --     softc+0x34 -> 802bd02c   softc+0x64 -> 802bd05c   softc+0x98 -> 802bd090
     mk("bztrap")
     dbg:command("bpset 80029904,1,{trace >>" .. DIR ..
@@ -91,9 +91,9 @@ end
 -- The SCSI tap USED TO BE HERE and was removed. install_write_tap
 -- from Lua does not work on this machine: the r4000 space is 64 bit, the
 -- first mask is 0xff00000000000000 and sol2 raises "integer value will be
--- misrepresented in lua" ANTES de llamar a la funcion, con lo que MAME se va
--- entero (segfault).  El registro de ordenes SCSI vive ahora en el driver,
--- en `ews4800.cpp` (scsi_r/scsi_w), y se enciende con EWS_SCSILOG=<ruta>.
+-- misrepresented in lua" BEFORE calling the function, which takes the whole of
+-- MAME down with a segfault. The SCSI command log now lives in the driver, in
+-- `ews4800.cpp` (scsi_r/scsi_w), and is turned on with EWS_SCSILOG=<path>.
 
 dbg.execution_state = "run"
 
@@ -115,12 +115,12 @@ local SAVENAME = os.getenv("EWS_SAVENAME") or "step"
 print("install armed")
 for f, t in pairs(KEYS) do print(string.format("  key at %d: %q", f, t)) end
 
--- EWS_PCHIST=1: histograma del PC, una muestra por frame.  Es el instrumento
--- to find out WHERE the time goes when the machine advances but slowly:
--- 30000 frames (500 s emulados) por cada "part" de un paquete son ordenes de
--- orders of magnitude more than it would cost on the real machine, so either
--- espera del guest o algo del rig lo obliga a darlo.  Se resuelve fuera con
--- unixsyms.py --addr, que ya nombra las direcciones del kernel.
+-- EWS_PCHIST=1: a histogram of the PC, one sample per frame. This is the
+-- instrument for finding out WHERE the time goes when the machine advances but
+-- slowly: 30000 frames, 500 emulated seconds, for each "part" of one package is
+-- orders of magnitude more than it would cost on the real machine, so either the
+-- guest is waiting for something or the rig is forcing it to. It is worked out
+-- afterwards with unixsyms.py --addr, which names the kernel addresses.
 _G.pchist = {}
 _G.pctotal, _G.pckern, _G.pcuser, _G.pcrom = 0, 0, 0, 0
 _G.pchist_on = os.getenv("EWS_PCHIST") == "1"
@@ -133,25 +133,25 @@ local function dump_pchist()
     table.sort(t, function(a, b) return a[2] > b[2] end)
     local h = io.open(DIR .. "/pchist.log", "w")
     if not h then return end
-    h:write(string.format("# frames %d muestras %d kernel %d usuario %d rom %d\n",
+    h:write(string.format("# frames %d samples %d kernel %d user %d rom %d\n",
         _G.frames, _G.pctotal, _G.pckern, _G.pcuser, _G.pcrom))
     for i = 1, #t do
         h:write(string.format("%08x %d\n", t[i][1], t[i][2]))
     end
     h:close()
-    print(string.format("[frame %d] histograma del PC: %d direcciones distintas",
+    print(string.format("[frame %d] PC histogram: %d distinct addresses",
           _G.frames, #t))
 end
 
--- BOOTDEV (NVSRAM 0xbe493030): 0 FDD, 2 DISCO, 3 CD-ROM, 4 cinta, 6 red.
--- BOOTUNIT (0x3034) es el SCSI ID.
+-- BOOTDEV (NVSRAM 0xbe493030): 0 FDD, 2 DISK, 3 CD-ROM, 4 tape, 6 network.
+-- BOOTUNIT (0x3034) is the SCSI ID.
 _G.bootdev = tonumber(os.getenv("EWS_BOOTDEV") or "3")
 _G.bootid = tonumber(os.getenv("EWS_BOOTID") or os.getenv("EWS_CDID") or "0")
 
 -- EWS_KEYFILE: the HOT key channel.
 --
--- EWS_KEYS se fija al arrancar MAME, y eso dejo la instalacion colgada de un
--- `Choice ? [ yes no ]` que no se podia contestar: MAME con `-video none` no
+-- EWS_KEYS is fixed when MAME starts, and that left one install hanging on a
+-- `Choice ? [ yes no ]` that could not be answered: MAME with `-video none`
 -- answers neither SIGTERM nor SIGINT, so the only way out was to kill it. With
 -- this, writing one line into the file from outside is enough.
 _G.keyfile = os.getenv("EWS_KEYFILE")
@@ -171,10 +171,10 @@ local function poll_keyfile()
         for _, l in ipairs(rest) do w:write(l, "\n") end
         w:close()
     end
-    -- `!shot [label]`: screen dump ON DEMAND. Dumps used to go at fixed frame
-    -- fijos programados al arrancar, lo que deja ciego en cuanto se conduce una
+    -- `!shot [label]`: screen dump ON DEMAND. Dumps used to go at frame numbers
+    -- fixed when MAME started, which leaves you blind as soon as you are driving
     -- an interactive shell: you have to look AFTER each command, and there is no
-    -- de antemano en que frame cae.
+    -- way to know in advance which frame the answer lands on.
     if first:match("^!shot") then
         local tag = first:match("^!shot%s+(%S+)$") or ("d" .. tostring(_G.frames))
         local ok2, err2 = pcall(function() _G.shot(tag) end)
@@ -225,7 +225,7 @@ local function sample_console()
     end
 end
 
--- global a proposito: poll_keyfile se define ANTES y necesita llamarla
+-- global on purpose: poll_keyfile is defined EARLIER and needs to call it
 function _G.shot(tag)
     local f = io.open(string.format("%s/fb%s.bin", DIR, tag), "wb")
     if not f then return end
@@ -253,7 +253,7 @@ _G.h = function()
     if not _G.bzwatch_on and _G.frames >= _G.bzwatch_at then
         _G.bzwatch_on = true
         arm_bzwatch()
-        print(string.format("[frame %d] watchpoints del zumbador armados", _G.frames))
+        print(string.format("[frame %d] buzzer watchpoints armed", _G.frames))
     end
 
     -- EWS_BUZFIX repairs the kernel inconsistency that kills the machine
@@ -262,18 +262,18 @@ _G.h = function()
     -- Measured on the machine, not assumed:
     --     BUZINIT  bcon=802BCFF8  gatype=00000000  buzz=00000000  s98=BE4A0050
     -- that is: for OUR machine class (14) the kernel installs the buzzer at
-    -- softc[0x98] = 0xBE4A0050, pero `bcon_vtbuz` despacha por `gatype`, que se
+    -- softc[0x98] = 0xBE4A0050, but `bcon_vtbuz` dispatches on `gatype`, which
     -- stays 0 because class 14 without a node never assigns it, and type 0
     -- reads softc[0x64], which NOBODY ever writes (the only kernel writer is
     -- bcon_buzinit+0x50, and only for classes 1 to 4). Result: garbage
     -- 0xFF000000 -> TLB fault -> PANIC.
     --
     -- softc[0x64] is given the address the kernel itself installed for
-    -- this machine (0xBE4A0050, physical 0x3E4A0050, ALREADY MAPPED in ews4800.cpp
-    -- No address is invented and gatype is not touched, so the
-    -- dibujado de la consola sigue por el camino del tipo 0, que es el que
+    -- this machine (0xBE4A0050, physical 0x3E4A0050, ALREADY MAPPED in
+    -- ews4800.cpp). No address is invented and gatype is not touched, so the
+    -- console drawing still goes down the type 0 path, which is the one that
     -- works. It is a repair of the rig, not a claim about the hardware:
-    -- root cause remains that we tell the kernel we are a /330.
+    -- the root cause remains that we tell the kernel we are a /330.
     if os.getenv("EWS_BUZFIX") == "1" and _G.frames >= 9000
        and _G.frames % 200 == 0 then
         if mem:read_u32(0x002a4e00) == 0x802bcff8 then     -- bcon -> softc
@@ -283,7 +283,7 @@ _G.h = function()
                 if not _G.buzfix_done then
                     _G.buzfix_done = true
                     print(string.format(
-                        "[frame %d] zumbador reparado: softc[0x64] = %08X",
+                        "[frame %d] buzzer repaired: softc[0x64] = %08X",
                         _G.frames, s98))
                 end
             end
@@ -293,15 +293,15 @@ _G.h = function()
     -- The PC is read as TEXT, not through .value.
     --
     -- cpu.state["PC"].value returns the 64 bit PC, and for any kernel or ROM
-    -- address that is 0xFFFFFFFF8........, which does NOT fit in
-    -- el entero con signo de Lua**: sol2 lanza (el mismo
-    -- "integer value will be misrepresented in lua" que tumba los grifos) y el
-    -- pcall se traga la muestra. Solo sobreviven las direcciones de usuario,
-    -- que son 0x00000000004....., pequenas y positivas.
+    -- address that is 0xFFFFFFFF8........, which does NOT fit in Lua's signed
+    -- integer: sol2 raises the same "integer value will be misrepresented in
+    -- lua" that brings the taps down, and the pcall swallows the sample. Only
+    -- user addresses survive, the 0x00000000004..... ones, small and positive.
     --
-    -- O sea que el histograma "100% en espacio de usuario" de la primera medida
-    -- NO era una medida: era el instrumento descartando en silencio todo lo que
-    -- pasaba en el kernel. `tostring()` formatea sin convertir y no falla nunca.
+    -- So the "100% in user space" histogram of the first measurement was NOT a
+    -- measurement: it was the instrument silently discarding everything that
+    -- happened in the kernel. `tostring()` formats without converting and it
+    -- never fails.
     if _G.pchist_on then
         local ok, hex = pcall(function() return tostring(cpu.state["PC"]) end)
         local v = ok and hex and tonumber(hex:sub(-8), 16)
@@ -358,7 +358,7 @@ _G.h = function()
     -- save state so that each step does not repeat 20 minutes of booting
     if SAVEAT and _G.frames == SAVEAT then
         local ok, err = pcall(function() mac:save(SAVENAME) end)
-        print(string.format("[frame %d] estado guardado en %q: %s", _G.frames,
+        print(string.format("[frame %d] state saved to %q: %s", _G.frames,
               SAVENAME, ok and "ok" or tostring(err)))
     end
 
@@ -372,7 +372,7 @@ _G.h = function()
 
     if _G.frames == FRAMES or _G.forced_end then
         sample_console()
-        print("=== CONSOLA DEL KERNEL")
+        print("=== KERNEL CONSOLE")
         for _, s in ipairs(_G.order) do
             print(string.format("  [%6d] %s", _G.seen[s], s))
         end

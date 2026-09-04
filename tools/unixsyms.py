@@ -73,7 +73,7 @@ def main():
             continue
         print(f'  {value:08x}  size {size:6d}  {name}')
         n += 1
-    print(f'{n} de {len(syms)} símbolos')
+    print(f'{n} of {len(syms)} symbols')
 
 
 main()
