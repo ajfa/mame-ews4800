@@ -76,8 +76,8 @@ if [ "$WINDOW" = yes ]; then
         ${EWS_RAM:+-ramsize $EWS_RAM} \
         -scsi:0 cdrom -cdrm "$ISO" \
         -scsi:1 harddisk -hard "$DISK" \
-        -rs232a terminal \
-        -sound none -video soft -window -nomaximize -skip_gameinfo -numscreens 2 \
+        -rs232a null_modem \
+        -sound none -video soft -window -nomaximize -skip_gameinfo -numscreens 1 \
         -debugger none -debug \
         ${EWS_OSLOG:+-oslog} \
         -autoboot_script "$EWS_WORK/install.lua" -autoboot_delay 0
