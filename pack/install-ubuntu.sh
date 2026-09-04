@@ -58,6 +58,11 @@ rm -rf "$EWS_WORK/fvtags"; mkdir -p "$EWS_WORK/fvtags"
 RUN="$EWS_WORK/install"; rm -rf "$RUN"; mkdir -p "$RUN"
 cp "$EWS_TOOLS/harness/install.lua" "$EWS_WORK/install.lua"
 
+# The machine identification word. Without it the kernel takes another path and never
+# writes to the console: black screen, no error. Measured value.
+export EWS4800_SPOOF_ID="${EWS4800_SPOOF_ID:-0x101e}"
+export EWS_BANKS="${EWS_BANKS:-1}"
+export EWS_TAGDIR="$EWS_WORK/fvtags"
 export EWS_BUZFIX=1
 export EWS_KEYFILE="$EWS_WORK/keys.in"
 : > "$EWS_KEYFILE"

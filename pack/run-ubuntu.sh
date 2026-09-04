@@ -1,10 +1,19 @@
 #!/bin/bash
 # Boots the installed UX/4800 disk image to Console Login: and leaves the guest running.
 #
-# Headless on purpose. With -video none there is no window to focus and no warning screen
-# to dismiss, and the run does not depend on which window the desktop has in front.
-# Screens are read by dumping the frame buffer, see below.
+# A window by default, because the point of an emulated workstation is to look at it.
+# --headless runs it with no window, which is how the automated runs work: nothing to
+# focus, nothing to dismiss, and screens read by dumping the frame buffer instead.
 set -e
+
+WINDOW=yes
+for a in "$@"; do
+    case "$a" in
+        --headless) WINDOW=no ;;
+        --window)   WINDOW=yes ;;
+        *) echo "unknown flag: $a"; exit 1 ;;
+    esac
+done
 
 EWS_WORK="${EWS_WORK:-$HOME/ews4800}"
 EWS_TOOLS="${EWS_TOOLS:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -32,6 +41,13 @@ rm -rf "$EWS_WORK/fvtags"; mkdir -p "$EWS_WORK/fvtags"
 
 cp "$EWS_TOOLS/harness/install.lua" "$EWS_WORK/install.lua"
 
+# The machine identification word. WITHOUT THIS THE SYSTEM DOES NOT BOOT: the driver
+# reports a different machine, the kernel takes another path and never writes a single
+# character to the console, so you get a black screen and no error. Measured value.
+export EWS4800_SPOOF_ID="${EWS4800_SPOOF_ID:-0x101e}"
+export EWS_BANKS="${EWS_BANKS:-1}"
+# install.lua writes its screen dumps to $HOME/ews4800/fvtags unless told otherwise.
+export EWS_TAGDIR="$EWS_WORK/fvtags"
 export EWS_BUZFIX=1
 export EWS_BOOTDEV=2 EWS_BOOTID=1
 export EWS_KEYFILE="$EWS_WORK/keys.in"
@@ -39,12 +55,37 @@ export EWS_KEYFILE="$EWS_WORK/keys.in"
 export EWS_FRAMES="${EWS_FRAMES:-150000}"
 export EWS_SHOTS="${EWS_SHOTS:-5000,10000,15000,20000,30000}"
 
-# No X server is needed. WSLg or a desktop dropping the display has killed long runs
-# before; the dummy video driver removes the dependency entirely.
-[ "${EWS_X11:-0}" = "1" ] || export SDL_VIDEODRIVER=dummy
-
 cd "$RUN"
 echo "booting, Console Login: appears around frame 15000, about eight minutes"
+
+if [ "$WINDOW" = yes ]; then
+    # -video soft, not the default opengl: a virtual machine without 3D acceleration
+    # has no OpenGL, and MAME then dies with "video_init: Initialization failed".
+    # Software rendering is plenty for a 1280x1024 monochrome console.
+    #
+    # MAME shows two screens before it starts. -skip_gameinfo removes the machine
+    # information one. The red warning screen, raised because the driver is marked
+    # MACHINE_NOT_WORKING, has NO option in 0.288: -showusage lists only
+    # -skip_gameinfo and -confirm_quit. Press any key and it goes.
+    #
+    # Never fullscreen: -window -nomaximize.
+    echo "a red warning screen comes first: press any key. Then type into the window."
+    exec "$BIN" \
+        -rompath "$EWS_WORK/roms" \
+        ews4800_310 \
+        ${EWS_RAM:+-ramsize $EWS_RAM} \
+        -scsi:0 cdrom -cdrm "$ISO" \
+        -scsi:1 harddisk -hard "$DISK" \
+        -rs232a terminal \
+        -sound none -video soft -window -nomaximize -skip_gameinfo -numscreens 2 \
+        -debugger none -debug \
+        ${EWS_OSLOG:+-oslog} \
+        -autoboot_script "$EWS_WORK/install.lua" -autoboot_delay 0
+fi
+
+# Headless. No X server is needed at all: a desktop dropping the display has killed
+# long runs before, and the dummy driver removes the dependency entirely.
+export SDL_VIDEODRIVER=dummy
 "$BIN" \
     -rompath "$EWS_WORK/roms" \
     ews4800_310 \
@@ -52,7 +93,7 @@ echo "booting, Console Login: appears around frame 15000, about eight minutes"
     -scsi:0 cdrom -cdrm "$ISO" \
     -scsi:1 harddisk -hard "$DISK" \
     -rs232a terminal \
-    -video none -sound none -nothrottle -window -nomaximize \
+    -video none -sound none -nothrottle \
     -debugger none -debug \
     ${EWS_OSLOG:+-oslog} \
     -autoboot_script "$EWS_WORK/install.lua" -autoboot_delay 0 \
