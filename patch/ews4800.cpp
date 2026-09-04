@@ -1,0 +1,1787 @@
+// license:BSD-3-Clause
+// copyright-holders:Patrick Mackinlay, ajfa
+
+/*
+ * NEC EWS4800 systems.
+ *
+ * Sources:
+ *  - http://www.jira-net.or.jp/vm/data/1993090101/1993090101knr/4-1-14.pdf
+ *  - http://wiki.netbsd.org/ports/ews4800mips/
+ *
+ * TODO:
+ *  - everything
+ */
+
+#include "emu.h"
+
+// processors and memory
+#include "cpu/mips/r4000.h"
+#include "machine/ram.h"
+
+// i/o devices
+#include "machine/z80scc.h"
+#include "machine/am79c90.h"
+#include "machine/timekpr.h"
+#include "machine/ncr53c90.h"
+#include "machine/upd765.h"
+#include "imagedev/floppy.h"
+
+// busses and connectors
+#include "machine/nscsi_bus.h"
+
+#include "screen.h"
+#include "bus/nscsi/cd.h"
+#include "bus/nscsi/hd.h"
+#include "bus/rs232/rs232.h"
+#include "bus/rs232/terminal.h"
+
+#include "debugger.h"
+
+/*
+ * LOG_DMA is the slot's DMA engine alone: a couple of lines per transfer, so
+ * unlike the general log it can be left on for a whole CD boot.  It is what
+ * splits "the driver never started the engine" from "the engine started and
+ * stalled", which the controller's own log cannot tell apart.
+ */
+#define LOG_DMA (1U << 1)
+
+#define VERBOSE 0
+#include "logmacro.h"
+
+namespace {
+
+class ews4800_state : public driver_device
+{
+public:
+	ews4800_state(machine_config const &mconfig, device_type type, char const *tag)
+		: driver_device(mconfig, type, tag)
+		, m_cpu(*this, "cpu")
+		, m_ram(*this, "ram")
+		, m_rtc(*this, "rtc")
+		, m_scc(*this, "scc%u", 0U)
+		, m_scsibus(*this, "scsi")
+		, m_scsi(*this, "ncr53c96")
+		, m_net(*this, "net")
+		, m_fdc(*this, "fdc")
+		, m_screen(*this, "screen")
+		, m_fbram(*this, "fbram")
+		, m_kbdport(*this, "kbd%u", 0U)
+	{
+	}
+
+	// machine config
+	void ews4800_310(machine_config &config);
+
+	void init();
+
+protected:
+	// driver_device overrides
+	virtual void machine_start() override ATTR_COLD;
+	virtual void machine_reset() override ATTR_COLD;
+
+	// address maps
+	void cpu_map(address_map &map) ATTR_COLD;
+
+	u16 lance_r(offs_t offset, u16 mem_mask = 0xffff);
+	void lance_w(offs_t offset, u16 data, u16 mem_mask = 0xffff);
+
+	u64 sysc_r(offs_t offset, u64 mem_mask = ~0);
+	void sysc_w(offs_t offset, u64 data, u64 mem_mask = ~0);
+
+	u64 iobus_r(offs_t offset, u64 mem_mask = ~0);
+	void iobus_w(offs_t offset, u64 data, u64 mem_mask = ~0);
+
+	u8 scsi_r(offs_t offset);
+	void scsi_w(offs_t offset, u8 data);
+	void scsilog(char tag, u32 reg, u32 value);
+	void scsilog_pc(char tag, u32 reg, u32 value);
+
+	u64 lrio_r(offs_t offset, u64 mem_mask = ~0);
+	void lrio_w(offs_t offset, u64 data, u64 mem_mask = ~0);
+
+	u64 gactrl_r(offs_t offset, u64 mem_mask = ~0);
+	void gactrl_w(offs_t offset, u64 data, u64 mem_mask = ~0);
+	u64 gareg_r(offs_t offset, u64 mem_mask = ~0);
+	void gareg_w(offs_t offset, u64 data, u64 mem_mask = ~0);
+	u32 screen_update(screen_device &screen, bitmap_rgb32 &bitmap, rectangle const &cliprect);
+
+	// keyboard, on SCC 0 channel B
+	void kbd_dtr_w(int state);
+	void kbd_int_w(int state);
+	void kbd_int_update();
+	void kbd_queue(u8 data);
+	TIMER_CALLBACK_MEMBER(kbd_shift);
+	TIMER_CALLBACK_MEMBER(kbd_scan);
+
+	void int_update();
+	bool devint_active() const;
+	void devint_update();
+	TIMER_CALLBACK_MEMBER(timer_expire);
+	TIMER_CALLBACK_MEMBER(dma_transfer);
+
+private:
+	// processors and memory
+	required_device<r4000_device> m_cpu;
+	required_device<ram_device> m_ram;
+
+	// i/o devices
+	required_device<m48t02_device> m_rtc;
+	required_device_array<z80scc_device, 2> m_scc;
+	required_device<nscsi_bus_device> m_scsibus;
+	required_device<ncr53c94_device> m_scsi;
+	required_device<am7990_device> m_net;
+	required_device<upd72065_device> m_fdc;
+
+	// system controller registers (0x1e000000, 32-bit regs on the 64-bit bus)
+	u32 m_sysc[64]{};
+	u32 m_int_state = 0;
+	emu_timer *m_timer = nullptr;
+
+	// device bus window (0x1e400000-0x1e4fffff)
+	static constexpr u32 IOBUS_SIZE = 0x100000;
+	std::unique_ptr<u32[]> m_iobus;
+
+	// device bus interrupt status word (0x1e40a008)
+	u32 m_devint = 0;
+
+	// machine-id spoof for the /430 disk's software (see the 0x1fc0fe00 map entry)
+	bool m_spoof_id = false;
+	u16 m_spoof_id_value = 0x1030;
+
+	// rewrite the POST's memory-bank byte for the /430 disk (see case 0x93010)
+	bool m_membank_hack = true;
+	s32 m_membank_value = -1;   // >= 0 forces the byte, for probing the encoding
+
+	// captured VOYAGER console line (see the 0x1ff00000 map entry)
+	std::string m_vuart_line;
+
+	// slot 1 DMA engine (the "4350"-type engine at 0x1e418000)
+	u32 m_dma_addr = 0;
+	u32 m_dma_count = 0;
+	bool m_dma_active = false;
+	bool m_dma_in = false;
+	bool m_dma_drq = false;
+	emu_timer *m_dma_timer = nullptr;
+
+	/*
+	 * SCSI command log, for the 1 Gb vmkfs "Software Timeout".  It lives here
+	 * rather than in the Lua script because a Lua memory tap is unusable on
+	 * this machine: the r4000's space is 64 bits wide, so the first mask is
+	 * 0xff00000000000000 and sol2 throws ("integer value will be
+	 * misrepresented in lua") before the callback runs, taking MAME with it.
+	 */
+	FILE *m_scsilog = nullptr;
+
+	// second LR4370 register block (0x1e800000-0x1e80ffff)
+	static constexpr u32 LRIO_SIZE = 0x10000;
+	std::unique_ptr<u32[]> m_lrio;
+
+	// graphics adapter control registers (0xf0f00000-0xf0f0ffff)
+	static constexpr u32 GACTRL_SIZE = 0x10000;
+	static constexpr u32 GA_STATUS_REG = 0x0e00;
+	std::unique_ptr<u32[]> m_gactrl;
+	u32 m_ga_id = 0;
+
+	// bitmap-console adapter registers (0x15f00000-0x15f0ffff)
+	static constexpr u32 GAREG_SIZE = 0x10000;
+	std::unique_ptr<u32[]> m_gareg;
+
+	/*
+	 * Bitmap console.  bcon_frbinit programs 1280x1024 with a line pitch of
+	 * 2048, and what the console actually writes is one bit per pixel: the
+	 * vertical autocorrelation of a frame-buffer dump peaks at a 256-byte line
+	 * (90% overlap, with its multiples behind it), which is those 2048 pixels
+	 * packed.  Read that way the dump is legible -- it is the EWS-UX banner.
+	 */
+	static constexpr unsigned FB_WIDTH = 1280;
+	static constexpr unsigned FB_HEIGHT = 1024;
+	static constexpr unsigned FB_PITCH = 256; // bytes per line, 1 bit per pixel
+	required_device<screen_device> m_screen;
+	required_shared_ptr<u64> m_fbram;
+
+	/*
+	 * Keyboard.  4800 baud, eight bits, odd parity, one stop bit -- all read off
+	 * the SCC registers the kernel writes.  The line is bit-banged into the SCC's
+	 * own receiver rather than handed over as a byte, so that the parity the
+	 * driver checks in RR1 is the parity that was actually sent.
+	 */
+	static constexpr unsigned KBD_BAUD = 4800;
+	static constexpr unsigned KBD_SCAN_HZ = 120;
+	required_ioport_array<6> m_kbdport;
+	emu_timer *m_kbd_timer = nullptr;
+	emu_timer *m_kbd_scan_timer = nullptr;
+	bool m_kbdlog = false;
+	u16 m_kbd_last[6] = { 0 };
+	u8 m_kbd_fifo[32] = { 0 };
+	u8 m_kbd_head = 0;
+	u8 m_kbd_tail = 0;
+	u16 m_kbd_frame = 0; // start bit, eight data bits, parity, stop
+	u8 m_kbd_bit = 0;
+	u8 m_kbd_id = 0;
+	int m_kbd_dtr = 1;
+};
+
+// The boot ROM's first POST step reads five identification registers and
+// compares them against constants held in the ROM at 0xbfc001c8/1cc and
+// 0xbfc001e0/1e4/1e8.  Values taken from the ROM itself.
+static constexpr struct { u8 offset; u32 value; } SYSC_ID[] =
+{
+	{ 0xc0, 0x101e101e },
+	{ 0xc4, 0xaa0f0000 },
+	{ 0xe0, 0x8a78001f },
+	{ 0xe4, 0x01f04028 },
+	{ 0xe8, 0x00000001 },
+};
+
+/*
+ * Reset values the POST's system controller test requires from the second
+ * LR4370 register block (the checks that branch to 0xbfc02498).  0x7020 is the
+ * part number: 0xbfc01ebc masks the readback with 0xffff0000 and compares it
+ * against 0x4370, which is what identifies the chip as an LSI Logic LR4370 --
+ * the same name the ROM's message table uses at 0xbfc26020.
+ */
+static constexpr struct { u32 offset; u32 value; } LRIO_RESET[] =
+{
+	// 0xbfc01f58 loops over seven consecutive registers requiring one in each
+	{ 0x5000, 0x00000001 },
+	{ 0x5004, 0x00000001 },
+	{ 0x5008, 0x00000001 },
+	{ 0x500c, 0x00000001 },
+	{ 0x5010, 0x00000001 },
+	{ 0x5014, 0x00000001 },
+	{ 0x5018, 0x00000001 },
+
+	{ 0x5020, 0x00001000 },
+	{ 0x502c, 0x80000000 },
+	{ 0x7020, 0x43700000 },
+};
+
+u32 const LRIO_INVALIDATE = 0x5028;
+u32 const LRIO_TABLE = 0x7600;
+u32 const LRIO_COMMAND = 0x7030;
+
+/*
+ * The 32 interrupt sources are grouped onto the six MIPS hardware interrupt
+ * lines.  The grouping is given by a table in the boot ROM at 0xbfc011e0,
+ * which the POST walks from bit 31 down to bit 0 while checking the matching
+ * CP0 Cause bit: bits 31-27 -> IP7, 26-22 -> IP6, 21-17 -> IP5, 16-12 -> IP4,
+ * 11-6 -> IP3, 5-0 -> IP2.  r4000's execute_set_input() maps input line n to
+ * Cause bit (IPEX0 << n), so line 5 is IP7 and line 0 is IP2.
+ */
+static constexpr u32 INT_GROUP[6] =
+{
+	0x0000003f, // line 0 (IP2): bits  5-0
+	0x00000fc0, // line 1 (IP3): bits 11-6
+	0x0001f000, // line 2 (IP4): bits 16-12
+	0x003e0000, // line 3 (IP5): bits 21-17
+	0x07c00000, // line 4 (IP6): bits 26-22
+	0xf8000000, // line 5 (IP7): bits 31-27
+};
+
+void ews4800_state::machine_start()
+{
+	m_timer = timer_alloc(FUNC(ews4800_state::timer_expire), this);
+	m_dma_timer = timer_alloc(FUNC(ews4800_state::dma_transfer), this);
+
+	m_iobus = std::make_unique<u32[]>(IOBUS_SIZE / 4);
+	m_lrio = std::make_unique<u32[]>(LRIO_SIZE / 4);
+	m_gactrl = std::make_unique<u32[]>(GACTRL_SIZE / 4);
+	m_gareg = std::make_unique<u32[]>(GAREG_SIZE / 4);
+	m_kbd_timer = timer_alloc(FUNC(ews4800_state::kbd_shift), this);
+	m_kbd_scan_timer = timer_alloc(FUNC(ews4800_state::kbd_scan), this);
+
+	/*
+	 * The byte the keyboard sends after 0xa0 is its type.  kbmskbreset does not
+	 * compare it with anything -- it goes straight into the driver's event queue
+	 * as 0xa000 | id -- so it is a knob until a real keyboard turns up.
+	 */
+	// EWS_KBDLOG=1 logs the scan code actually sent for every key. Without it
+	// there is no way to tell "the natural keyboard pressed a different key"
+	// from "the guest table is not the one I read", and those need opposite
+	// fixes.
+	// EWS_UNMAPLOG=1 sends every access to unmapped memory to logerror (MAME
+	// needs -oslog to show it). This is what says which registers the frame
+	// buffer driver asks for, instead of deducing the address.
+	if (char const *const env = std::getenv("EWS_UNMAPLOG"))
+		if (strtoul(env, nullptr, 0) != 0)
+			m_cpu->space(AS_PROGRAM).set_log_unmap(true);
+
+	if (char const *const env = std::getenv("EWS_KBDLOG"))
+		m_kbdlog = (strtoul(env, nullptr, 0) != 0);
+
+	if (char const *const env = std::getenv("EWS4800_KBDID"))
+		m_kbd_id = u8(strtoul(env, nullptr, 0));
+
+	// EWS_SCSILOG = path of the SCSI command log
+	if (char const *const env = std::getenv("EWS_SCSILOG"))
+		m_scsilog = std::fopen(env, "w");
+
+	/*
+	 * Which id the post-POST spoof reports (see the 0x1fc0fe00 map entry).
+	 * The two foreign media want different ones -- the /430 disk's kernel is
+	 * VOYAGER-only and needs 0x1030, while the R12.2 CD's boot block maps a
+	 * /310 (0x1020) onto 0x101e and would then load IOPBOOT.01 instead of
+	 * .07 -- so it is a knob, not a constant.  An environment variable keeps
+	 * it out of the machine configuration: the whole spoof is scaffolding for
+	 * foreign media and goes away once period /310 media exist.
+	 */
+	if (char const *const env = std::getenv("EWS4800_SPOOF_ID"))
+		m_spoof_id_value = u16(strtoul(env, nullptr, 0));
+
+	/*
+	 * Which graphics adapter the status register at 0xf0f00e00 claims to be.
+	 * EWS-UX identifies the adapter from bits 3-7 of that register: bcon_dset
+	 * (the bitmap console's device set, 0x8002c15c in the CD's vmunix.01) and
+	 * swfb_gainit (0x80082004) both read it and switch on (value & 0xf8).
+	 * 0x90 and 0x10 mean GA_C1, 0x98/0x18 GA_LC1, 0xa0/0x50 GA_C3.  Bit 0 is
+	 * VSYNC and bit 1 the 60/71 Hz clock, per NetBSD's gareg.h.  Zero -- the
+	 * default -- keeps the old behaviour of plain storage, so nothing that
+	 * works today can notice this.
+	 */
+	if (char const *const env = std::getenv("EWS4800_GAID"))
+		m_ga_id = u32(strtoul(env, nullptr, 0));
+
+	/*
+	 * The memory-bank rewrite at case 0x93058 applies to BOTH foreign media:
+	 * each boot path passes the byte to the kernel as the bank count, and the
+	 * POST's own (banks + 3) encoding makes the kernel believe in memory that
+	 * is not there.  EWS4800_MEMHACK=0 disables it, EWS4800_MEMBYTE=<n> forces
+	 * a value -- both only for probing the encoding.
+	 */
+	m_membank_hack = true;
+	if (char const *const env = std::getenv("EWS4800_MEMHACK"))
+		m_membank_hack = (strtoul(env, nullptr, 0) != 0);
+	if (char const *const env = std::getenv("EWS4800_MEMBYTE"))
+		m_membank_value = s32(strtol(env, nullptr, 0));
+
+	save_item(NAME(m_sysc));
+	save_item(NAME(m_int_state));
+	save_item(NAME(m_devint));
+	save_item(NAME(m_spoof_id));
+	save_item(NAME(m_spoof_id_value));
+	save_item(NAME(m_membank_hack));
+	save_item(NAME(m_membank_value));
+	save_item(NAME(m_dma_addr));
+	save_item(NAME(m_dma_count));
+	save_item(NAME(m_dma_active));
+	save_item(NAME(m_dma_in));
+	save_item(NAME(m_dma_drq));
+	save_pointer(NAME(m_iobus), IOBUS_SIZE / 4);
+	save_pointer(NAME(m_lrio), LRIO_SIZE / 4);
+	save_pointer(NAME(m_gactrl), GACTRL_SIZE / 4);
+	save_pointer(NAME(m_gareg), GAREG_SIZE / 4);
+	save_item(NAME(m_ga_id));
+	save_item(NAME(m_kbd_fifo));
+	save_item(NAME(m_kbd_head));
+	save_item(NAME(m_kbd_tail));
+	save_item(NAME(m_kbd_frame));
+	save_item(NAME(m_kbd_bit));
+	save_item(NAME(m_kbd_id));
+	save_item(NAME(m_kbd_dtr));
+	save_item(NAME(m_kbd_last));
+}
+
+void ews4800_state::machine_reset()
+{
+	std::fill(std::begin(m_sysc), std::end(m_sysc), 0);
+
+	for (auto const &id : SYSC_ID)
+		m_sysc[id.offset >> 2] = id.value;
+
+	m_int_state = 0;
+	m_devint = 0;
+	m_dma_active = false;
+	m_dma_drq = false;
+	m_spoof_id = false;
+	int_update();
+
+	std::fill_n(m_iobus.get(), IOBUS_SIZE / 4, 0);
+
+	std::fill_n(m_lrio.get(), LRIO_SIZE / 4, 0);
+
+	for (auto const &id : LRIO_RESET)
+		m_lrio[id.offset / 4] = id.value;
+
+	std::fill_n(m_gactrl.get(), GACTRL_SIZE / 4, 0);
+	std::fill_n(m_gareg.get(), GAREG_SIZE / 4, 0);
+
+	m_kbd_head = m_kbd_tail = 0;
+	m_kbd_bit = 0;
+	m_kbd_dtr = 1;
+	m_scc[0]->rxb_w(1); // idle mark
+	std::fill(std::begin(m_kbd_last), std::end(m_kbd_last), 0);
+	m_kbd_scan_timer->adjust(attotime::from_hz(KBD_SCAN_HZ), 0, attotime::from_hz(KBD_SCAN_HZ));
+
+	/*
+	 * NVSRAM IPL mode.  NetBSD's sbd_tr2.h documents 0=normal, 1=error continue,
+	 * 2=details, 3=loop, and the boot ROM stops at 0xbfc0bee4 unless it reads 1
+	 * (0xbfc0bed0).  It reports a "CPU logical error" first: its logic test does
+	 * addu on 0xaaaaaaaaaaaaaaaa and expects all 64 bits to survive, which MIPS
+	 * calls UNPREDICTABLE for operands that are not sign-extended 32-bit values
+	 * -- so this is NEC's silicon, not something to change in the CPU core.
+	 * Error-continue is a real user setting, and it lets the machine boot past
+	 * the report.
+	 *
+	 * NVSRAM is byte-wide behind the 32-bit bus, so the byte sits in the top of
+	 * its own word.
+	 */
+	m_iobus[(0x9302c) / 4] = 0x01000000;
+
+	/*
+	 * NVSRAM boot device: 0=floppy, 2=disk, 4=tape, 6=network (sbd_tr2.h).
+	 * With the NVSRAM otherwise zeroed the ROM retries a floppy boot forever;
+	 * point it at the disk to follow the SCSI path.
+	 */
+	m_iobus[(0x93030) / 4] = 0x02000000;
+
+	/*
+	 * NVSRAM console type: 0=frame buffer, 1=serial (sbd_tr2.h).  The POST
+	 * ignores it (sec. 9.5 of the findings), but the on-disk second boot rebooted
+	 * with its console-not-active error while the graphics adapter is
+	 * unmodelled, so ask for the serial console.
+	 */
+	m_iobus[(0x93020) / 4] = 0x01000000;
+
+	/*
+	 * VOYAGER parameters for the on-disk 2ndboot (see the 0x1fd80000 map
+	 * entry).  The item table at 0xa09107b8 maps group 3 item N to a byte
+	 * offset in the group's block at +0xc00:
+	 *  - (3,4)  offset 0x0c: console selection; index 1 is the serial case.
+	 *  - (3,14) offset 0xa6: serial console port for the ROM's console
+	 *    service (0xbfc37db0): 1 = SIO-A, the only wired terminal.  Zero is
+	 *    no port at all, which made every console write a silent no-op.
+	 */
+	/*
+	 * Index 1 selects the serial console with the "input filename" prompt
+	 * (the case sets the subtype's low nibble, 0x80900224, which is what the
+	 * prompt tests at 0x80900574); index 2 is the serial console without it.
+	 */
+	m_cpu->space(0).write_byte(0x1fd80c0c, 2);
+	m_cpu->space(0).write_byte(0x1fd80ca6, 1);
+
+	/*
+	 * (3,16) offset 0xbe, 14 bytes: boot file name.  Without one the 2ndboot
+	 * prompts "input filename:" -- and its console-init calls the ROM
+	 * service's function 0, which the /310 ROM does not implement, so the
+	 * console stays inactive, getchar returns zero without blocking and the
+	 * prompt's line buffer overflows into the program itself (the Trap at
+	 * 0xa09019dc).  A preset name skips the prompt entirely.
+	 */
+	static char const bootname[] = "vmunix";
+	for (unsigned i = 0; i < sizeof(bootname); i++)
+		m_cpu->space(0).write_byte(0x1fd80cbe + i, bootname[i]);
+
+	/*
+	 * (3,24) offset 0x114, 4 bytes: physical address where the reserved H/W
+	 * work area starts (top of usable RAM).  The 2ndboot stores it in
+	 * bootinfo+0x34 and 16MB-minus-it in bootinfo+0x38 (0x809011a8), and the
+	 * kernel subtracts that from its memory-bank size -- zero here meant
+	 * "reserve all 16MB", which was the set_unused_mem panic.  The /310
+	 * ROM's own work area lives at 0xff5000-0xffffff, so reserve the top
+	 * 64KB.
+	 */
+	m_cpu->space(0).write_dword(0x1fd80d14, 0x00ff0000);
+}
+
+void ews4800_state::int_update()
+{
+	for (unsigned line = 0; line < std::size(INT_GROUP); line++)
+		m_cpu->set_input_line(line, (m_int_state & INT_GROUP[line]) ? ASSERT_LINE : CLEAR_LINE);
+}
+
+TIMER_CALLBACK_MEMBER(ews4800_state::timer_expire)
+{
+	/*
+	 * Interrupt source 31.  Confirmed by the relocated boot code the second
+	 * EPROM runs from RAM: its handler increments a tick counter and then
+	 * writes 0x7c to 0x1e000000, which is (31 << 2) with bit 31 clear, i.e.
+	 * exactly this source being acknowledged through the bit-addressed port.
+	 */
+	m_int_state |= 0x80000000U;
+
+	int_update();
+}
+
+void ews4800_state::init()
+{
+	// map the configured ram
+	m_cpu->space(0).install_ram(0x00000000, m_ram->mask(), m_ram->pointer());
+}
+
+
+void ews4800_state::cpu_map(address_map &map)
+{
+	map(0x1e000000, 0x1e0000ff).rw(FUNC(ews4800_state::sysc_r), FUNC(ews4800_state::sysc_w));
+	map(0x1e400000, 0x1e4fffff).rw(FUNC(ews4800_state::iobus_r), FUNC(ews4800_state::iobus_w));
+
+	/*
+	 * Second LR4370 register block.  The POST's system controller test
+	 * (0xbfc01e60..0xbfc02490) is a run of plain write/read-back pairs on
+	 * 0x4008, 0x5000-0x502c, 0x6000-0x600c, 0x7004-0x7020 and 0x7678, so
+	 * storage is enough to satisfy it; the individual registers are not
+	 * identified yet.  Failing this test is what made the POST report
+	 * "LR4370 error" from its message table at 0xbfc26020.
+	 */
+	/*
+	 * The two Z85C30s.  The POST tests the serial pair first and then the
+	 * keyboard/mouse pair, reporting through its message table at 0xbfc26800
+	 * ("SIO-A default error" .. "KB 85C30 default error"); the tests at
+	 * 0xbfc02900 and 0xbfc02c00 give the addresses.
+	 *
+	 * Register layout is NetBSD's zschan (sbd_tr2.h): channel B's control and
+	 * data at +0 and +4, channel A's at +8 and +C, i.e. after shifting out the
+	 * two low address bits, bit 1 selects the channel and bit 0 control/data --
+	 * which is exactly what ab_dc_r/w expect.  The parts are byte-wide, so on
+	 * the 64-bit big-endian bus each register sits in the top byte of its own
+	 * 32-bit half.
+	 *
+	 * These must follow the device bus window above so they override it.
+	 */
+	map(0x1e440000, 0x1e44000f).rw(m_scc[1], FUNC(z80scc_device::ab_dc_r), FUNC(z80scc_device::ab_dc_w)).umask64(0xff000000ff000000);
+	map(0x1e480000, 0x1e48000f).rw(m_scc[0], FUNC(z80scc_device::ab_dc_r), FUNC(z80scc_device::ab_dc_w)).umask64(0xff000000ff000000);
+
+	/*
+	 * SCSI controller, device bus slot 1.  With NVSRAM BOOTDEV=2 the ROM's
+	 * disk-boot driver (0xbfc50000..0xbfc5a000) initialises a chip whose
+	 * register addresses it takes from a descriptor: 0xbfc5314c returns base
+	 * 0xbe410000 for controller type 0x10 (id 0x1053c960 -- the hex digits
+	 * spell 53C96) and 0xbe418000 for type 0x20 (id 0x20004350).  The measured
+	 * boot path uses the former, with the classic 53C94 init sequence at
+	 * 0xbfc50d20 (chip reset, nop, clock conversion, config, select timeout
+	 * 0x17, bus reset).  Registers are contiguous bytes +0..+0xb, which is
+	 * also what the POST's board map showed for slot 1.
+	 *
+	 * The slot's +0x8000 block is its DMA engine: 0xbfc58044 loads two words
+	 * through 0x1e418008 and then polls it for a busy bit; 0x1e418000/4 are
+	 * control.  Not modelled yet.
+	 *
+	 * 0x1e40a008 (slot 0, +0xa000 block) is the device-bus interrupt status
+	 * word: the SCSI wait loop at 0xbfc59898 masks it with 0x00020002 (bits 1
+	 * and 17), the FDC wait at 0xbfc33444 checks bit 2 of the top byte.  The
+	 * 53C94's interrupt is reflected in bit 1; bit 17 is taken to be the DMA
+	 * completion.
+	 */
+	/*
+	 * The scsi_r/scsi_w shims do exactly what the 53C94's own map does -- that
+	 * map dispatches to the same generic read/write, 53C94 registers 0xc and
+	 * 0xf included -- and only add the command log, which costs nothing when
+	 * EWS_SCSILOG is unset.
+	 */
+	map(0x1e410000, 0x1e41000f).rw(FUNC(ews4800_state::scsi_r), FUNC(ews4800_state::scsi_w));
+
+	/*
+	 * Floppy controller, device bus slot 2.  The boot loop the ROM was stuck in
+	 * at 0xbfc334d8/0xbfc33500 is the textbook uPD765 handshake: wait for
+	 * (0x1e420000 & 0xc0) == 0x80 (RQM=1, DIO=0) while draining 0x1e420004,
+	 * then a command-phase writer (0xbfc33560) and a result-phase reader
+	 * (0xbfc335d8) move bytes through 0x1e420004, and 0xbfc33518 samples bit 4
+	 * (CB).  So +0 is the main status register and +4 the data register --
+	 * NetBSD gives the TR2's FDC as a uPD72065, whose map has them at 0 and 1.
+	 */
+	map(0x1e420000, 0x1e420007).m(m_fdc, FUNC(upd72065_device::map)).umask64(0xff000000ff000000);
+
+	map(0x1e800000, 0x1e80ffff).rw(FUNC(ews4800_state::lrio_r), FUNC(ews4800_state::lrio_w));
+
+	/*
+	 * Graphics adapter.  The boot ROM reaches it through kseg2 at 0xf0f00000
+	 * and 0xf0200000, i.e. via the TLB; the physical address was unknown until
+	 * the TLB started working, at which point MAME's unmapped-access log showed
+	 * a read of physical 0xf0f00e00 -- so the firmware maps it identically.
+	 * TR2 has the frame buffer below the control registers in the same way
+	 * (GAFB 0xf0000000, GACTRL 0xf5f00000 in NetBSD's sbd_tr2.h).
+	 *
+	 * Nothing is emulated yet: this is storage so the adapter test can run and
+	 * be traced.  0xf0f00e00 in particular is read by the ROM's text output
+	 * (0xbfc0d260) and bit 4 selects the display timing.
+	 */
+	map(0xf0000000, 0xf07fffff).ram(); // frame buffer
+	map(0xf0f00000, 0xf0f0ffff).rw(FUNC(ews4800_state::gactrl_r), FUNC(ews4800_state::gactrl_w));
+
+	/*
+	 * ...and the same adapter where this machine's EWS-UX actually goes for it.
+	 * bcon_frbinit -- the bitmap console's frame buffer init -- has one branch per
+	 * adapter type, and the type this kernel ends up with (0) puts the frame
+	 * buffer at 0xb0000000 and the registers at 0xb5f00c00, i.e. gareg.h's
+	 * +0x05f00000 offset but in kseg1, so no TLB entry is needed for either.
+	 * Measured: 36128 frame-buffer writes from struct_zero and 9249 register
+	 * accesses from bcon_vilinit and bcon_markclr, all of them thrown away
+	 * because nothing answered here.
+	 *
+	 * The console is 1280x1024 with a 2048-byte stride, from the same routine.
+	 */
+	map(0x10000000, 0x103fffff).ram().share("fbram"); // frame buffer, bitmap console
+	map(0x15f00000, 0x15f0ffff).rw(FUNC(ews4800_state::gareg_r), FUNC(ews4800_state::gareg_w));
+
+	/*
+	 * Console buzzer.  bcon_buzinit is the only writer of either buzzer pointer
+	 * in the whole kernel, and it installs one of two fixed addresses depending
+	 * on the machine class byte at ostype+2: classes 1-4 get softc[0x64] =
+	 * 0xba015000 and every other class up to 21 gets softc[0x98] = 0xbe4a0050,
+	 * both kseg1, i.e. physical 0x3a015000 and 0x3e4a0050.  bcon_vtbuz then
+	 * picks between the two by adapter type -- types 0-4,7,8,9 read softc[0x64]
+	 * and 5,6,10-15 read softc[0x98] -- and writes a halfword to turn the tone
+	 * on, with bcon_buzzeroff writing another to turn it off.
+	 *
+	 * Nothing is emulated: the tone itself is of no interest, and these are
+	 * write-only in the two routines above, so storage is enough to keep the
+	 * write from going to an unmapped address.  Both classes are mapped because
+	 * which one the kernel uses is a property of the machine it thinks it is.
+	 */
+	map(0x3a015000, 0x3a015007).ram(); // buzzer, machine classes 1-4
+	map(0x3e4a0050, 0x3e4a0057).ram(); // buzzer, machine classes 5-21
+
+	map(0x1fc00000, 0x1fcfffff).rom().region("eprom", 0);
+
+	/*
+	 * Machine-id spoof for the /430 disk's software.  The EWS-UX kernel on
+	 * that disk is built for the VOYAGER machines only: its machine-dependent
+	 * init bails out unless the sbdinfo id at 0xbfc0fe00 reads 0x1030/0x1032
+	 * (0x80220d1c in the loaded kernel), leaving the memory-bank description
+	 * empty, which is what its "unknown MACHINE_GROUP"/"too big unix" panic
+	 * was.  The /310 ROM itself dispatches its timer-tick handler on id
+	 * 0x1020 -- but from a RAM copy made during second-EPROM init, so the
+	 * ROM word can be switched once the POST has completed (progress 0xE0)
+	 * without upsetting it.  Real /310 sbdinfo is 10 20 10 20 90 00 01 01
+	 * (the id twice, then 0x9000 0x0101).
+	 *
+	 * The id reported is EWS4800_SPOOF_ID (default 0x1030, what the /430
+	 * disk needs); 0x1020 disables the spoof by reporting the true id.
+	 * Remove all of this when period /310 media exist.
+	 */
+	map(0x1fc0fe00, 0x1fc0fe07).lr64(
+		[this](offs_t offset) -> u64
+		{
+			u64 const id = m_spoof_id ? m_spoof_id_value : 0x1020;
+
+			return (id << 48) | (id << 32) | 0x90000101ULL;
+		}, "sbdinfo_r");
+
+	/*
+	 * Parameter memory the on-disk second boot expects.  The /430-generation
+	 * ("VOYAGER") 2ndboot loaded from the disk image reads its parameter
+	 * database from byte-contiguous NVSRAM at physical 0x1fd80000 (groups at
+	 * +0, +0x800, +0xc00; 0x80906480 in the relocated boot).  The /310 has
+	 * nothing there, so every parameter read zero; parameter (3,4) selects
+	 * the console and zero maps to a console type the disk boot cannot use,
+	 * which is what its "Console is not active with FDboot" reboot was.
+	 * Storage plus a serial-console selection (poked in machine_reset) lets
+	 * the foreign 2ndboot proceed.
+	 */
+	map(0x1fd80000, 0x1fd83fff).ram();
+
+	/*
+	 * VOYAGER console UART stub.  The kernel drives the /430's own serial
+	 * console directly: it polls physical 0x1ff00072 for bit 4 (transmit
+	 * ready) and writes data bytes to 0x1ff00073 (0x801f20b4 in the loaded
+	 * kernel).  Reading always-ready and capturing the bytes into the error
+	 * log makes the kernel's console output visible.
+	 */
+	map(0x1ff00000, 0x1ff00fff).lrw8(
+		[this](offs_t offset) -> u8
+		{
+			return (offset == 0x72) ? 0x10 : 0;
+		}, "vuart_r",
+		[this](offs_t offset, u8 data)
+		{
+			if (offset != 0x73)
+				return;
+
+			if (data == '\n' || m_vuart_line.length() > 250)
+			{
+				logerror("VCONS: %s\n", m_vuart_line);
+				m_vuart_line.clear();
+			}
+			else if (data >= 0x20 && data < 0x7f)
+				m_vuart_line += char(data);
+		}, "vuart_w");
+}
+
+/*
+ * Device bus.  Devices sit at 0x1e400000 + n * 0x10000 with further blocks at
+ * 0x1000 granularity inside each slot; the block at +0x8000 is present for all
+ * eleven slots and looks like a DMA/controller register set.
+ *
+ * Nothing here is modelled as a real device yet: the POST's board test only
+ * writes register patterns and reads them back, so plain storage is enough to
+ * get through it.  Two exceptions found so far:
+ *
+ *  - 0x9004 is a status field (bits 0-2 and 8-10 always read as one) merged
+ *    with a writeable control field (bits 4-6 and 12).  The POST writes
+ *    0x000300ff then zero to 0x9000 and requires 0x707 in mask 0x1777, then
+ *    writes 0x60 and requires it back in mask 0x1070 (0xbfc012b0).
+ *  - slot 0's 0x8000 register only implements the bits in 0x175f: the POST
+ *    writes 0x20f0 and compares the readback under mask 0x3751 against
+ *    0x20f0 & 0x175f, so bit 13 must read back as zero (0xbfc014f4).
+ *    The other slots write values that already fit their own masks.
+ */
+u32 const IOBUS_CSR = 0x9004;
+u32 const IOBUS_CSR_STATUS = 0x00000707;
+u32 const IOBUS_CSR_CONTROL = 0x00001070;
+u32 const IOBUS_SLOT0_CSR = 0x8000;
+u32 const IOBUS_SLOT0_MASK = 0x0000175f;
+/*
+ * The device bus is the second level of a two-level interrupt tree, and its
+ * three registers sit in slot 0's 0xa000 block.  NetBSD calls the whole thing
+ * the ASO bus and documents it for the sister machine (sbd_tr2a.h, machine id
+ * 0x101f against this one's 0x101e): a status word, a mask, and above it the
+ * system controller ("INTC") at 0x1e000000, one of whose 32 sources every
+ * device-bus interrupt is funnelled into.
+ *
+ * The EWS-UX kernel confirms the layout for this machine:
+ *  - intmask_init (0x80247f5c) is instruction-for-instruction NetBSD's
+ *    tr2a_intr_init(): INTC mask = 0x80000000, then 0x1e40a00c |= 0x8000.
+ *  - INT2intRL (0x802478d4) requires INTC bit 16, then reads the device-bus
+ *    status from 0x1e40a010 and dispatches on bits 1, 17, 0 and 7 -- bits 1
+ *    and 17 being exactly the 0x00020002 the ROM's disk driver polls for at
+ *    0x1e40a008.  It finishes by writing 0x40 = (16 << 2) to the INTC's
+ *    bit-addressed port, i.e. clearing source 16.
+ *  - DIRintmaskon/DIRintmaskoff (0x802484ec/0x802483e8) and nenableint
+ *    (0x80247ff0) are mask on and off; they and their jump table at
+ *    0x8025dbb0 give the bit each interrupt number owns, after masking the
+ *    register with 0x00f0837d for machine 0x101f and 0x00f280ff otherwise:
+ *
+ *       0  0x00000001  lance          7  0x00020000  53C96 DMA
+ *       1  0x00000002  53C96          9  0x00000040  keyboard/mouse SCC
+ *       4  0x00300010  serial SCC    10  0x00000100  (second 53C710 on TR2A)
+ *       6  0x00000200  (53C710)      14  0x00000080
+ *
+ *    The numbers agree with NetBSD's own table for TR2A (0 lance, 4 and 9 the
+ *    two Z85230s, 6 and 10 its pair of 53C710s), and the bits agree with the
+ *    ones INT2intRL dispatches on, so on this bus a source's mask bit and its
+ *    status bit are the same bit.
+ *
+ * So 0xa008 and 0xa010 are the same status (the ROM polls one, the kernel's
+ * handler reads the other) and 0xa00c gates which of its bits reach the INTC.
+ * Only the mask matters for compatibility: it comes out of reset as zero, so
+ * the ROM -- which polls and never writes it -- sees no interrupts at all.
+ */
+u32 const IOBUS_INT_STATUS = 0xa008;
+u32 const IOBUS_INT_MASK = 0xa00c;
+u32 const IOBUS_INT_STATUS2 = 0xa010;
+u32 const IOBUS_INT_MASK_VALID = 0x00f280ff;
+u32 const IOBUS_INT_LANCE = 0x00000001;
+u32 const IOBUS_INT_SCSI = 0x00000002;
+u32 const IOBUS_INT_DMA = 0x00020000;
+u32 const IOBUS_INT_KBMS = 0x00000040;
+
+// the device-bus sources INT2intRL dispatches, i.e. those wired to INTC
+// source 16; the serial and keyboard SCCs go to source 26 instead
+u32 const IOBUS_INT2 =
+	IOBUS_INT_LANCE | IOBUS_INT_SCSI | IOBUS_INT_DMA | 0x00000080;
+unsigned const SYSC_INT_SOURCE_INT2 = 16;
+
+// the keyboard and mouse SCC is interrupt number 9 in the table above, so it
+// owns device-bus bit 0x40, and it goes to INTC source 26 rather than 16
+unsigned const SYSC_INT_SOURCE_SCC_KBMS = 26;
+
+/*
+ * Slot 1 DMA engine.  The ROM's disk driver keeps the engine's register
+ * addresses in a descriptor (filled at 0xbfc50b54 for engine type 0x20004350
+ * from base+4/+8/+0x10/+0x14) and its command codes in fields set at
+ * 0xbfc508a8: 6 (used at 0xbfc58044 before each retry), 0x20/0x30 (start,
+ * picked by bit 7 of the direction argument at 0xbfc5887c), 0x20000/0x40000
+ * (interrupt acknowledges), and busy mask 0x10000 for the readback poll.
+ *
+ * +0x10 is the memory address (full 32 bits, POST-tested with -1) and +0x14
+ * the transfer count (POST tests it with 0x00ffffff: 24 bits).  0x1e418004
+ * is a control register whose bits 10-11 the boot code sets after the chip
+ * init (0xbfc50134) and clears when re-initialising (0xbfc50d9c), taken to be
+ * interrupt enables; plain storage covers it.
+ */
+u32 const DMA_CSR = 0x18008;
+u32 const DMA_ADDR = 0x18010;
+u32 const DMA_COUNT = 0x18014;
+u32 const DMA_CSR_BUSY = 0x00010000;
+u32 const DMA_CMD_INIT = 0x06;
+u32 const DMA_CMD_GO = 0x07;
+u32 const DMA_CMD_DIR_OUT = 0x20;
+u32 const DMA_CMD_DIR_IN = 0x30;
+
+/*
+ * Fold the device-bus interrupt status into the system controller.  The
+ * enabled sources are a level input to INTC source 16: the kernel's handler
+ * services the device first and only then clears the source, so by the time it
+ * writes to the bit-addressed port the input has already gone away and the
+ * write is what actually leaves the bit clear.
+ *
+ * With the mask at its reset value of zero -- where the boot ROM leaves it,
+ * since it polls the status instead -- nothing reaches the INTC at all, so the
+ * ROM's behaviour is unchanged.
+ */
+bool ews4800_state::devint_active() const
+{
+	return (m_devint & m_iobus[IOBUS_INT_MASK / 4] & IOBUS_INT2) != 0;
+}
+
+void ews4800_state::devint_update()
+{
+	u32 const bit = 1U << SYSC_INT_SOURCE_INT2;
+	u32 const state = devint_active() ? (m_int_state | bit) : (m_int_state & ~bit);
+
+	// the 53C94 toggles its interrupt line for every transfer the boot ROM
+	// makes, and that path never reaches the interrupt controller at all
+	// (the mask is zero), so leave the CPU alone unless something changed
+	if (state != m_int_state)
+	{
+		m_int_state = state;
+
+		int_update();
+	}
+}
+
+/*
+ * Log the individual 32-bit registers rather than the 64-bit word: printing
+ * base + offset * 8 makes 0x5004 look like 0x5000 and hides loops that step by
+ * four, which is exactly what the POST's register tests do.
+ */
+u64 ews4800_state::lrio_r(offs_t offset, u64 mem_mask)
+{
+	for (unsigned i = 0; i < 2; i++)
+		if (i ? ACCESSING_BITS_0_31 : ACCESSING_BITS_32_63)
+			LOG("lrio_r 0x%08x data 0x%08x\n",
+				0x1e800000 + (offset * 2 + i) * 4, m_lrio[offset * 2 + i]);
+
+	return (u64(m_lrio[offset * 2 + 0]) << 32) | m_lrio[offset * 2 + 1];
+}
+
+void ews4800_state::lrio_w(offs_t offset, u64 data, u64 mem_mask)
+{
+	for (unsigned i = 0; i < 2; i++)
+	{
+		if (!(i ? ACCESSING_BITS_0_31 : ACCESSING_BITS_32_63))
+			continue;
+
+		u32 const value = i ? u32(data) : u32(data >> 32);
+		unsigned const reg = (offset * 2 + i) * 4;
+
+		LOG("lrio_w 0x%08x data 0x%08x\n", 0x1e800000 + reg, value);
+
+		m_lrio[offset * 2 + i] = value;
+
+		/*
+		 * Entry invalidate.  The POST fills the 32 entries at 0x7600 with
+		 * 0x80000000 | index (0xbfc02254), then walks them again writing each
+		 * index to 0x5028 and requiring the entry to read back without bit 31
+		 * (0xbfc02280).  So bit 31 is a valid flag and 0x5028 clears it for the
+		 * entry it names.
+		 */
+		if (reg == LRIO_INVALIDATE)
+			m_lrio[(LRIO_TABLE + (value & 0x1f) * 4) / 4] &= ~0x80000000U;
+
+		/*
+		 * Command register: the second EPROM writes one and then spins until it
+		 * reads back zero (0xbfc82afc, address 0xbe707030 + (a0 << 20), so
+		 * 0x1e807030 for a0 = 1).  Whatever it starts is not modelled, so
+		 * complete it immediately.  The POST's own register test never touches
+		 * 0x7030, so this cannot upset it.
+		 */
+		if (reg == LRIO_COMMAND)
+			m_lrio[reg / 4] = 0;
+	}
+}
+
+/*
+ * Graphics adapter control registers.  Storage, but logged with the calling PC:
+ * the boot ROM leaves the cached copy of its graphics module (0x9fc60000) and
+ * ends up halted in uncached code at 0xbfc0c7e4, and neither an exception nor a
+ * call explains the transition, so the last accesses before it are the clue.
+ */
+u64 ews4800_state::gactrl_r(offs_t offset, u64 mem_mask)
+{
+	u32 data[2];
+
+	for (unsigned i = 0; i < 2; i++)
+	{
+		unsigned const reg = offset * 2 + i;
+
+		data[i] = m_gactrl[reg];
+
+		/*
+		 * The status register is the only one that has to answer rather than
+		 * remember: it is where the adapter says which model it is.
+		 */
+		if (m_ga_id && reg * 4 == GA_STATUS_REG)
+		{
+			// bit 0 is VSYNC: assert it for part of each 60 Hz frame
+			double const frame = machine().time().as_double() * 60.0;
+
+			data[i] = m_ga_id;
+			if (frame - floor(frame) < 0.08)
+				data[i] |= 1;
+		}
+
+		if (i ? ACCESSING_BITS_0_31 : ACCESSING_BITS_32_63)
+			LOG("%s gactrl_r 0x%08x data 0x%08x\n", machine().describe_context(),
+				0xf0f00000 + reg * 4, data[i]);
+	}
+
+	return (u64(data[0]) << 32) | data[1];
+}
+
+void ews4800_state::gactrl_w(offs_t offset, u64 data, u64 mem_mask)
+{
+	for (unsigned i = 0; i < 2; i++)
+	{
+		if (!(i ? ACCESSING_BITS_0_31 : ACCESSING_BITS_32_63))
+			continue;
+
+		u32 const value = i ? u32(data) : u32(data >> 32);
+
+		LOG("%s gactrl_w 0x%08x data 0x%08x\n", machine().describe_context(),
+			0xf0f00000 + (offset * 2 + i) * 4, value);
+
+		m_gactrl[offset * 2 + i] = value;
+	}
+}
+
+/*
+ * Bitmap-console adapter registers.  Storage for now, logged with the calling
+ * PC: everything measured so far is a halfword store (bcon_vilinit writes 4 and
+ * 7 at +0x0c00 and +0x0c04, bcon_markclr clears +0x0c08, +0x0c0a and +0x0c0c in
+ * a 4096-iteration loop), and nothing reads a register back waiting on it, so
+ * remembering the value cannot deadlock the driver.
+ */
+u64 ews4800_state::gareg_r(offs_t offset, u64 mem_mask)
+{
+	for (unsigned i = 0; i < 2; i++)
+		if (i ? ACCESSING_BITS_0_31 : ACCESSING_BITS_32_63)
+			LOG("%s gareg_r 0x%08x data 0x%08x\n", machine().describe_context(),
+				0x15f00000 + (offset * 2 + i) * 4, m_gareg[offset * 2 + i]);
+
+	return (u64(m_gareg[offset * 2 + 0]) << 32) | m_gareg[offset * 2 + 1];
+}
+
+void ews4800_state::gareg_w(offs_t offset, u64 data, u64 mem_mask)
+{
+	for (unsigned i = 0; i < 2; i++)
+	{
+		if (!(i ? ACCESSING_BITS_0_31 : ACCESSING_BITS_32_63))
+			continue;
+
+		u32 const value = i ? u32(data) : u32(data >> 32);
+
+		LOG("%s gareg_w 0x%08x data 0x%08x\n", machine().describe_context(),
+			0x15f00000 + (offset * 2 + i) * 4, value);
+
+		m_gareg[offset * 2 + i] = value;
+	}
+}
+
+/*
+ * One bit per pixel, leftmost pixel in the most significant bit, on a
+ * big-endian 64-bit bus -- so within each word the first byte is the top one.
+ * Colour is not decoded: the palette registers are still storage, and the
+ * console only ever sets one bit per pixel anyway.
+ */
+u32 ews4800_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, rectangle const &cliprect)
+{
+	for (int y = cliprect.min_y; y <= cliprect.max_y; y++)
+	{
+		u32 *scanline = &bitmap.pix(y, cliprect.min_x);
+
+		for (int x = cliprect.min_x; x <= cliprect.max_x; x++)
+		{
+			unsigned const byte = y * FB_PITCH + (x >> 3);
+			u64 const word = m_fbram[byte / 8];
+			u8 const bits = u8(word >> (56 - 8 * (byte & 7)));
+
+			*scanline++ = BIT(bits, 7 - (x & 7)) ? rgb_t::white() : rgb_t::black();
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * Keyboard.  The kernel never writes a command byte: what it does just before
+ * it starts waiting is drop DTR (WR5 = 0xe8) and raise it again (WR5 = 0x6a),
+ * after enabling the receiver.  That release is the keyboard's reset, and the
+ * answer it expects within thirty milliseconds is 0xa0 followed by a type byte
+ * (kbmskbreset at 0x80020dc0 in the CD kernel's vmunix.01).
+ *
+ * The SCC's DTR callback is active low, so the release is a rising edge here.
+ */
+void ews4800_state::kbd_dtr_w(int state)
+{
+	if (state && !m_kbd_dtr)
+	{
+		kbd_queue(0xa0);
+		kbd_queue(m_kbd_id);
+	}
+
+	m_kbd_dtr = state;
+}
+
+/*
+ * The SCC's interrupt.  Nothing carried it before, so a received byte woke
+ * nobody: the reset worked only because kbmskbreset polls RR0 directly, while
+ * kbmsint -- which is what turns a key into an event -- was never called.
+ */
+void ews4800_state::kbd_int_w(int state)
+{
+	if (state)
+		m_devint |= IOBUS_INT_KBMS;
+	else
+		m_devint &= ~IOBUS_INT_KBMS;
+
+	kbd_int_update();
+}
+
+void ews4800_state::kbd_int_update()
+{
+	u32 const bit = 1U << SYSC_INT_SOURCE_SCC_KBMS;
+	bool const active = (m_devint & m_iobus[IOBUS_INT_MASK / 4] & IOBUS_INT_KBMS) != 0;
+	u32 const state = active ? (m_int_state | bit) : (m_int_state & ~bit);
+
+	if (state != m_int_state)
+	{
+		m_int_state = state;
+
+		int_update();
+	}
+}
+
+/*
+ * Key scan.  Ports kbd0 to kbd4 hold scan codes 0x00 to 0x4f by position, so
+ * bit n of port p is code p * 16 + n; kbd5 is the modifiers, which live in the
+ * separate 0x78 block bcon_setkbflg decodes.  Bit 7 of the code is the break,
+ * exactly as the kernel's own 0x7e/0xfe and 0x7f/0xff pairs show.
+ */
+TIMER_CALLBACK_MEMBER(ews4800_state::kbd_scan)
+{
+	static u8 const MODIFIER[] = { 0x7b, 0x78 }; // shift, control
+
+	for (unsigned port = 0; port < std::size(m_kbd_last); port++)
+	{
+		u16 const now = m_kbdport[port]->read();
+		u16 const changed = now ^ m_kbd_last[port];
+
+		if (!changed)
+			continue;
+
+		for (unsigned bit = 0; bit < 16; bit++)
+		{
+			if (!BIT(changed, bit))
+				continue;
+
+			u8 code;
+			if (port < 5)
+				code = u8(port * 16 + bit);
+			else if (bit < std::size(MODIFIER))
+				code = MODIFIER[bit];
+			else
+				continue;
+
+			if (m_kbdlog)
+				logerror("kbd: port %u bit %u -> code 0x%02x %s\n",
+					port, bit, code, BIT(now, bit) ? "make" : "break");
+
+			kbd_queue(BIT(now, bit) ? code : (code | 0x80));
+		}
+
+		m_kbd_last[port] = now;
+	}
+}
+
+void ews4800_state::kbd_queue(u8 data)
+{
+	unsigned const next = (m_kbd_tail + 1) % std::size(m_kbd_fifo);
+
+	if (next == m_kbd_head)
+		return;
+
+	m_kbd_fifo[m_kbd_tail] = data;
+	m_kbd_tail = next;
+
+	if (!m_kbd_bit)
+		m_kbd_timer->adjust(attotime::from_hz(KBD_BAUD));
+}
+
+TIMER_CALLBACK_MEMBER(ews4800_state::kbd_shift)
+{
+	if (!m_kbd_bit)
+	{
+		if (m_kbd_head == m_kbd_tail)
+			return;
+
+		u8 const data = m_kbd_fifo[m_kbd_head];
+		m_kbd_head = (m_kbd_head + 1) % std::size(m_kbd_fifo);
+
+		// start bit, then the byte least significant bit first, then odd parity
+		unsigned const parity = population_count_32(data) & 1;
+		m_kbd_frame = (u16(data) << 1) | (parity ? 0 : 1) << 9 | 0x400;
+		m_kbd_bit = 11;
+	}
+
+	m_scc[0]->rxb_w(BIT(m_kbd_frame, 0));
+	m_kbd_frame >>= 1;
+
+	if (--m_kbd_bit || m_kbd_head != m_kbd_tail)
+		m_kbd_timer->adjust(attotime::from_hz(KBD_BAUD));
+	else
+		m_scc[0]->rxb_w(1);
+}
+
+u64 ews4800_state::iobus_r(offs_t offset, u64 mem_mask)
+{
+	u32 reg[2];
+
+	for (unsigned i = 0; i < 2; i++)
+	{
+		unsigned const n = offset * 2 + i;
+
+		switch (n * 4)
+		{
+		case IOBUS_CSR:
+			reg[i] = (m_iobus[n] & IOBUS_CSR_CONTROL) | IOBUS_CSR_STATUS;
+			break;
+		case IOBUS_INT_STATUS:
+		case IOBUS_INT_STATUS2:
+			reg[i] = m_iobus[n] | m_devint;
+			break;
+		case DMA_CSR:
+			reg[i] = (m_iobus[n] & ~DMA_CSR_BUSY) | (m_dma_active ? DMA_CSR_BUSY : 0);
+			break;
+		case DMA_ADDR:
+			reg[i] = m_dma_addr;
+			break;
+		case DMA_COUNT:
+			reg[i] = m_dma_count;
+			break;
+		default:
+			reg[i] = m_iobus[n];
+			break;
+		}
+	}
+
+	u64 const data = (u64(reg[0]) << 32) | reg[1];
+
+	for (unsigned i = 0; i < 2; i++)
+		if (i ? ACCESSING_BITS_0_31 : ACCESSING_BITS_32_63)
+			LOG("%s iobus_r 0x%08x data 0x%08x\n", machine().describe_context(),
+				0x1e400000 + (offset * 2 + i) * 4, reg[i]);
+
+	return data;
+}
+
+void ews4800_state::iobus_w(offs_t offset, u64 data, u64 mem_mask)
+{
+	for (unsigned i = 0; i < 2; i++)
+	{
+		unsigned const n = offset * 2 + i;
+
+		if (!(i ? ACCESSING_BITS_0_31 : ACCESSING_BITS_32_63))
+			continue;
+
+		// per 32-bit register and with the calling PC: logging the 64-bit word
+		// hides which half was written, and "which instruction" is usually the
+		// question
+		LOG("%s iobus_w 0x%08x data 0x%08x\n", machine().describe_context(),
+			0x1e400000 + n * 4, i ? u32(data) : u32(data >> 32));
+
+		u32 const value = i ? u32(data) : u32(data >> 32);
+
+		switch (n * 4)
+		{
+		case IOBUS_SLOT0_CSR:
+			m_iobus[n] = value & IOBUS_SLOT0_MASK;
+			break;
+
+		case IOBUS_INT_MASK:
+			m_iobus[n] = value & IOBUS_INT_MASK_VALID;
+			devint_update();
+			kbd_int_update();
+			break;
+
+		/*
+		 * POST progress byte.  Reaching 0xe0 (the end of the POST) arms the
+		 * machine-id spoof for the boot-time readers -- the ROM's own
+		 * id-dependent code has taken its RAM copy by then.
+		 *
+		 * The same point fixes up the NVSRAM memory code.  The /310 POST's
+		 * sizing routine writes 0x3058 = (16MB banks + 3): measured 4, 8 and
+		 * 12 for 16M, 80M and 144M of installed ram.  The /430 disk's second
+		 * boot reads that byte as the bank count itself and hands it to the
+		 * kernel in bootinfo+4 (with bootinfo+0 = count * 16MB), so the
+		 * kernel always believed in three banks -- 48MB -- of memory that is
+		 * not there, allocated pool objects in it, and panicked on the
+		 * garbage those allocations read back ("trap mapping error").
+		 * Rewriting the byte with the true bank count is only needed for
+		 * this foreign media; remove it with the rest of the /430 hacks.
+		 *
+		 * The CD needs the same correction, but EARLIER -- see case 0x93058.
+		 */
+		case 0x93010:
+			m_iobus[n] = value;
+			if ((value >> 24) == 0xe0)
+			{
+				m_spoof_id = true;
+
+			}
+			break;
+
+		/*
+		 * Memory configuration byte.  The /310 POST writes (16MB banks + 3)
+		 * here: measured 4, 8 and 12 for 16M, 80M and 144M installed.  Both
+		 * boot paths hand it to the kernel as bootinfo+4, and find_unused_mem
+		 * reads it as a 4-bit-per-group BANK COUNT -- nibble 4 selects the
+		 * "four 16MB banks" arm of the jump table at 0x8025da9c, which fills
+		 * mem_info with banks at 0, 16M, 32M and 48M.  With 16M installed the
+		 * kernel then sized physmem at 0x1e6d 8K pages (~61MB), carve_kvspace
+		 * mapped kseg2 onto physical memory that is not there, segmap_init's
+		 * aging list read back a NULL next pointer and the kernel panicked
+		 * with "trap mapping error" (FINDINGS sec. 34.8-sec. 34.11).
+		 *
+		 * So the byte must carry the true bank count, and it must do so from
+		 * the moment the POST writes it: rewriting at POST completion (0xe0)
+		 * was late enough for the /430 disk's second boot, which re-reads the
+		 * NVSRAM, but not for the CD's IOPBOOT.01, which takes it earlier.
+		 */
+		case 0x93058:
+			if (m_membank_value >= 0)
+				m_iobus[n] = u32(m_membank_value) << 24;
+			else if (m_membank_hack)
+				m_iobus[n] =
+					std::max<u32>(1, m_ram->size() / (16U << 20)) << 24;
+			else
+				m_iobus[n] = value;
+			break;
+
+		case DMA_CSR:
+			m_iobus[n] = value;
+			if (m_scsilog)
+				scsilog_pc('C', DMA_CSR, value);
+
+			switch (value)
+			{
+			case DMA_CMD_INIT:
+				m_dma_active = false;
+				break;
+
+			/*
+			 * 0x20 and 0x30 only pick the direction; they do NOT start the
+			 * engine.  Measured, not guessed: both the boot ROM (0xbfc58890,
+			 * 0xbfc588a0, 0xbfc5891c) and the kernel's simd driver (0x80044440,
+			 * 0x80044450, 0x800444b0) write 0x40000, then 0x20 or 0x30, then
+			 * the count and the address, and only then 0x07.  0x07 is the go.
+			 *
+			 * Reading 0x20/0x30 as the start worked for as long as every
+			 * transfer was a single chunk: the engine armed early and then sat
+			 * waiting for DRQ, so the later 0x07 was redundant.  It broke on
+			 * the first scatter-gather transfer -- a 128 KB WRITE(10) split
+			 * across 8 KB pages -- because to continue into the next element
+			 * the driver writes 0x06, acknowledges the interrupt, reloads count
+			 * and address, and then writes 0x07 ON ITS OWN.  With 0x07 ignored
+			 * the channel never re-armed, the SCSI command never completed, and
+			 * the kernel slept in idle() until its own 40-second watchdog fired
+			 * ("WARNING: SCSI: Software Timeout").
+			 *
+			 * The direction latches, which is what the continuation needs: it
+			 * never repeats 0x20/0x30.
+			 */
+			case DMA_CMD_DIR_IN:
+			case DMA_CMD_DIR_OUT:
+				m_dma_in = (value == DMA_CMD_DIR_IN);
+				break;
+
+			case DMA_CMD_GO:
+				m_dma_active = true;
+				if (m_scsilog)
+					scsilog_pc('M', value, m_dma_count);
+				LOGMASKED(LOG_DMA, "dma start %s addr 0x%08x count %d drq %d\n",
+					m_dma_in ? "in" : "out", m_dma_addr, m_dma_count, m_dma_drq);
+				m_dma_timer->adjust(attotime::zero);
+				break;
+
+			case IOBUS_INT_DMA:
+				m_devint &= ~IOBUS_INT_DMA;
+				devint_update();
+				break;
+			}
+			break;
+
+		case DMA_ADDR:
+			m_dma_addr = value;
+			if (m_scsilog)
+				scsilog_pc('A', DMA_ADDR, value);
+			break;
+
+		case DMA_COUNT:
+			m_dma_count = value & 0x00ffffff;
+			if (m_scsilog)
+				scsilog_pc('N', DMA_COUNT, m_dma_count);
+			break;
+
+		default:
+			m_iobus[n] = value;
+			break;
+		}
+	}
+}
+
+/*
+ * The 53C94 asserts DRQ per FIFO service; the transfer itself runs from a
+ * zero-length timer so it happens outside the chip's callback (the same
+ * pattern as mips_rambo).  The address the ROM loads is passed through
+ * untranslated apart from masking to the physical range.
+ */
+TIMER_CALLBACK_MEMBER(ews4800_state::dma_transfer)
+{
+	address_space &space = m_cpu->space(0);
+	u32 const started = m_dma_count;
+
+	while (m_dma_drq && m_dma_active && m_dma_count)
+	{
+		if (m_dma_in)
+			space.write_byte(m_dma_addr & 0x1fffffff, m_scsi->dma_r());
+		else
+			m_scsi->dma_w(space.read_byte(m_dma_addr & 0x1fffffff));
+
+		m_dma_addr++;
+
+		if (--m_dma_count == 0)
+		{
+			m_dma_active = false;
+			m_devint |= IOBUS_INT_DMA;
+			devint_update();
+		}
+	}
+
+	// only the end of a transfer, or a call that moved nothing: the engine is
+	// driven one call per DRQ, so logging every byte buries the boot in millions
+	// of lines
+	// the same condition as the trace below: end of transfer, or a call that
+	// moved nothing, which is what a stalled transfer looks like
+	if (m_scsilog && (!m_dma_active || started == m_dma_count))
+		scsilog(m_dma_in ? 'I' : 'O', started - m_dma_count, m_dma_count);
+
+	if (!m_dma_active || started == m_dma_count)
+		LOGMASKED(LOG_DMA, "dma %s moved %d, %d left, active %d drq %d\n",
+			m_dma_in ? "in" : "out", started - m_dma_count,
+			m_dma_count, m_dma_active, m_dma_drq);
+}
+
+/*
+ * One line per write: `<tag> <register> <value> <seconds>`, decoded outside by
+ * scsicdb.py.  What matters is register 2 (the FIFO, where the CDB goes in a
+ * byte at a time), register 3 (command: 0x41-0x44 select, bit 0x80 with DMA)
+ * and register 4 (target id), plus the DMA engine's address and count.  DMA
+ * *data* does not come through here -- it goes through dma_r/dma_w -- so the
+ * file stays down to the commands.
+ */
+void ews4800_state::scsilog(char tag, u32 reg, u32 value)
+{
+	std::fprintf(m_scsilog, "%c %x %x %.6f\n", tag, reg, value,
+		machine().time().as_double());
+}
+
+/*
+ * The same line plus the writing PC.  The point of the exercise is to read the
+ * guest's DMA routine rather than guess at the hardware: the transfer stops
+ * between scatter-gather elements, and the kernel is asleep in idle(), so what
+ * matters is which routine reloaded count and address and what it waits for.
+ */
+void ews4800_state::scsilog_pc(char tag, u32 reg, u32 value)
+{
+	std::fprintf(m_scsilog, "%c %x %x %.6f %x\n", tag, reg, value,
+		machine().time().as_double(), u32(m_cpu->pc()));
+}
+
+u8 ews4800_state::scsi_r(offs_t offset)
+{
+	return m_scsi->read(offset);
+}
+
+void ews4800_state::scsi_w(offs_t offset, u8 data)
+{
+	if (m_scsilog)
+		scsilog('S', offset, data);
+
+	m_scsi->write(offset, data);
+}
+
+/*
+ * System controller.
+ *
+ * Register 0x00 is a bit-addressed write port for the interrupt request
+ * register: writing (n << 2) | (d << 31) sets bit n of the request register to
+ * d.  Register 0x04 reads the request register back.  The POST walks all 32
+ * bits setting and clearing each in turn, checking both the readback and the
+ * corresponding CP0 Cause bit (0xbfc0109c..0xbfc01154).
+ *
+ * The remaining registers behave as plain read/write storage as far as the
+ * POST is concerned: it writes 0x01234567/0xfedcba98/0/-1 to 0x08, 0x24 and
+ * 0x28 and reads each back unchanged.  0xc0..0xe8 are read-only IDs.
+ */
+u32 const SYSC_INT_SET = 0x00;
+u32 const SYSC_INT_GET = 0x04;
+u32 const SYSC_TIMER_CTRL = 0x20;
+u32 const SYSC_TIMER_LOAD = 0x24;
+u32 const SYSC_TIMER_COUNT = 0x2c;
+u32 const SYSC_STATUS = 0x40;
+u32 const SYSC_STATUS_ERROR = 0x00000002;
+
+u64 ews4800_state::sysc_r(offs_t offset, u64 mem_mask)
+{
+	u32 reg[2];
+
+	for (unsigned i = 0; i < 2; i++)
+	{
+		unsigned const n = offset * 2 + i;
+
+		switch (n * 4)
+		{
+		case SYSC_INT_GET: reg[i] = m_int_state; break;
+		// the current count is not modelled; the POST only reads it back
+		// immediately after loading it
+		case SYSC_TIMER_COUNT: reg[i] = m_sysc[SYSC_TIMER_LOAD / 4]; break;
+		/*
+		 * Bit 1 of 0x40 is a status bit, not storage.  The memory test samples
+		 * it after each compare (0xbfc03cfc) and takes its error tail when it
+		 * is set, which is what makes the POST stop and display results instead
+		 * of handing off to the second EPROM.  The POST's own register test
+		 * (0xbfc00d00) writes 0x1f here and only requires bits 31-5 to read
+		 * back as zero, so reading bit 1 as zero satisfies it either way.
+		 */
+		case SYSC_STATUS: reg[i] = m_sysc[n] & ~SYSC_STATUS_ERROR; break;
+		default: reg[i] = m_sysc[n]; break;
+		}
+	}
+
+	// offset is in 64-bit units; the high half is the lower address (big endian)
+	u64 const data = (u64(reg[0]) << 32) | reg[1];
+
+	LOG("sysc_r 0x%08x data 0x%016x\n", 0x1e000000 + offset * 8, data);
+
+	return data;
+}
+
+void ews4800_state::sysc_w(offs_t offset, u64 data, u64 mem_mask)
+{
+	LOG("sysc_w 0x%08x data 0x%016x\n", 0x1e000000 + offset * 8, data);
+
+	for (unsigned i = 0; i < 2; i++)
+	{
+		unsigned const n = offset * 2 + i;
+
+		if (!(i ? ACCESSING_BITS_0_31 : ACCESSING_BITS_32_63))
+			continue;
+
+		u32 const value = i ? u32(data) : u32(data >> 32);
+
+		if (n * 4 == SYSC_INT_SET)
+		{
+			u32 const mask = 1U << ((value >> 2) & 31);
+
+			if (BIT(value, 31))
+				m_int_state |= mask;
+			else
+				m_int_state &= ~mask;
+
+			/*
+			 * The device bus is a LEVEL input to this latch, so a source it is
+			 * still driving comes straight back after the CPU clears it.  That
+			 * matters because the kernel's INT2intRL services exactly one
+			 * device-bus source per entry and then clears source 16 regardless
+			 * -- so with SCSI (bit 1) and its DMA (bit 17) both pending, the
+			 * one it did not service would be lost for good, and the driver
+			 * would sit waiting for a completion that never comes.
+			 *
+			 * Only the re-assert belongs here: the POST walks all 32 bits
+			 * setting and reading each back (0xbfc0109c), and with the mask at
+			 * its reset value of zero nothing is driving, so it is untouched.
+			 */
+			if (devint_active())
+				m_int_state |= 1U << SYSC_INT_SOURCE_INT2;
+
+			int_update();
+		}
+
+		/*
+		 * Interval timer.  The POST loads a count of 200000 into 0x24, reads it
+		 * back from 0x2c, then writes 0xc07c to 0x20 and spins until IP7 is
+		 * asserted (0xbfc01158..0xbfc011c0).  The earlier register test writes
+		 * only small values (0x7c and below) to 0x20, so bits 15-14 are taken
+		 * to be the run control.
+		 *
+		 * The counter runs at 20 MHz.  That is measured, not guessed, and it
+		 * used to be a guess of 1 MHz "that makes the POST count represent
+		 * 200 ms" -- which made the system clock 5 Hz instead of 100 and cost
+		 * a factor of TWENTY on everything the guest waits for.
+		 *
+		 * Three things agree on it:
+		 *
+		 *  - the kernel never reprograms this timer.  Logging every write to
+		 *    0x20/0x24 through a whole boot gives 39, all from the ROM at
+		 *    0.000084s: reload 0x30d40 = 200000, control 0xc07c.  So the tick
+		 *    period is 200000 / clock, full stop.
+		 *  - the kernel's own drv_usectohz (0x80155fc0) divides by 1000000 and
+		 *    multiplies by a literal 100, i.e. HZ = 100, a 10 ms tick.
+		 *    200000 / 10 ms = 20 MHz.
+		 *  - and the guest's clock agreed: sendmail stamped Dec 31 00:19:29 at
+		 *    frame 1404400, which is 6.5 emulated HOURS -- a ratio of 20.0.
+		 *
+		 * The symptom was that the machine sat in idle() 97% of the time (PC
+		 * histogram, EWS_PCHIST=1) while an install crawled: nothing was slow,
+		 * everything was just waiting twenty times too long.
+		 */
+		if (n * 4 == SYSC_TIMER_CTRL || n * 4 == SYSC_TIMER_LOAD)
+			if (m_scsilog)
+				scsilog_pc('T', n * 4, value);
+
+		if (n * 4 == SYSC_TIMER_CTRL)
+		{
+			if (value & 0xc000)
+			{
+				// periodic: it has a reload register, and the boot code the
+				// second EPROM runs from RAM counts ticks in a loop, so a
+				// one-shot leaves it waiting forever after the first
+				attotime const period =
+					attotime::from_ticks(m_sysc[SYSC_TIMER_LOAD / 4], 20'000'000);
+
+				m_timer->adjust(period, 0, period);
+			}
+			else
+				m_timer->enable(false);
+		}
+
+		// the identification registers are read-only
+		if (n * 4 < 0xc0)
+			m_sysc[n] = value;
+	}
+}
+
+u16 ews4800_state::lance_r(offs_t offset, u16 mem_mask)
+{
+	return 0;
+}
+
+void ews4800_state::lance_w(offs_t offset, u16 data, u16 mem_mask)
+{
+}
+
+static void ews4800_scsi_devices(device_slot_interface &device)
+{
+	device.option_add("harddisk", NSCSI_HARDDISK);
+	device.option_add("cdrom", NSCSI_CDROM);
+}
+
+static void ews4800_floppies(device_slot_interface &device)
+{
+	device.option_add("35hd", FLOPPY_35_HD);
+}
+
+/*
+ * irq  function
+ *  1   fdd, printer
+ *  2   ethernet, scsi
+ *  3   vme?
+ *  4   serial
+ *  5   clock
+ */
+void ews4800_state::ews4800_310(machine_config &config)
+{
+	R4000(config, m_cpu, 40_MHz_XTAL);
+	m_cpu->set_addrmap(AS_PROGRAM, &ews4800_state::cpu_map);
+
+	// 8 SIMM slots
+	RAM(config, m_ram);
+	m_ram->set_default_size("16M");
+	m_ram->set_extra_options("80M,144M");
+	m_ram->set_default_value(0);
+
+	// scsi bus and devices
+	NSCSI_BUS(config, m_scsibus);
+	NSCSI_CONNECTOR(config, "scsi:0", ews4800_scsi_devices, "harddisk");
+	NSCSI_CONNECTOR(config, "scsi:1", ews4800_scsi_devices, nullptr);
+	NSCSI_CONNECTOR(config, "scsi:2", ews4800_scsi_devices, nullptr);
+	NSCSI_CONNECTOR(config, "scsi:3", ews4800_scsi_devices, nullptr);
+	NSCSI_CONNECTOR(config, "scsi:4", ews4800_scsi_devices, nullptr);
+	NSCSI_CONNECTOR(config, "scsi:5", ews4800_scsi_devices, nullptr);
+	NSCSI_CONNECTOR(config, "scsi:6", ews4800_scsi_devices, nullptr);
+
+	// scsi host adapter (NCR53C96)
+	NCR53C94(config, m_scsi, 24_MHz_XTAL);
+	m_scsibus->set_external_device(7, m_scsi);
+	/*
+	 * BUSMD_0: pure 8-bit DMA.  Upstream had BUSMD_1 (16-bit DMA, a guess);
+	 * in that mode the 53C94 holds one byte back in the FIFO for pairing
+	 * (check_drq asserts only above one byte), and the boot ROM's disk driver
+	 * spins on FIFO-empty after each transfer (0xbfc58a44), which then never
+	 * comes.  The slot-1 DMA engine is modelled byte-wide, so mode 0 is the
+	 * consistent choice.
+	 */
+	m_scsi->set_busmd(ncr53c94_device::busmd_t::BUSMD_0);
+	m_scsi->irq_handler_cb().set([this](int state)
+	{
+		if (state)
+			m_devint |= IOBUS_INT_SCSI;
+		else
+			m_devint &= ~IOBUS_INT_SCSI;
+
+		devint_update();
+	});
+	m_scsi->drq_handler_cb().set([this](int state)
+	{
+		m_dma_drq = bool(state);
+
+		if (m_dma_drq && m_dma_active)
+			m_dma_timer->adjust(attotime::zero);
+	});
+
+	/*
+	 * Bitmap console.  The adapter's clock and CRTC registers are still storage,
+	 * so nothing selects a video mode: the screen is fixed at the geometry
+	 * bcon_frbinit programs, which is also the one gareg.h describes.
+	 */
+	SCREEN(config, m_screen, SCREEN_TYPE_RASTER);
+	m_screen->set_size(FB_WIDTH, FB_HEIGHT);
+	m_screen->set_visarea(0, FB_WIDTH - 1, 0, FB_HEIGHT - 1);
+	m_screen->set_physical_aspect(5, 4); // 1280x1024 is square-pixel on a 5:4 monitor
+	m_screen->set_refresh_hz(60);
+	m_screen->set_screen_update(FUNC(ews4800_state::screen_update));
+
+	// ethernet
+	AM7990(config, m_net, 10'000'000); // clock is a guess
+	//m_net->intr_out()
+	m_net->dma_in().set(FUNC(ews4800_state::lance_r));
+	m_net->dma_out().set(FUNC(ews4800_state::lance_w));
+
+	/*
+	 * Mouse on channel A, keyboard on channel B -- and now confirmed rather than
+	 * guessed: the kernel's own device database gives both KBMS_KEYBOARD and
+	 * KBMS_MOUSE a hardware base of 0x00480000, which is this SCC, and it drives
+	 * the keyboard through the channel-B register pair (kbms_cmst_addr_b and
+	 * kbms_data_addr_b, set from base + 0 and base + 4).
+	 */
+	SCC85230(config, m_scc[0], 4.915200_MHz_XTAL); // TODO: clock unconfirmed
+	SCC85230(config, m_scc[1], 4.915200_MHz_XTAL); // TODO: clock unconfirmed
+
+	/*
+	 * Channel RxC/TxC clocks.  Without them a transmit never completes when
+	 * the firmware selects the external clock source, and the ROM's console
+	 * putc then burns a huge delay loop per character (0xbfc378ac) waiting
+	 * for the transmitter to drain.  9600*16 matches the usual x16 mode.
+	 */
+	m_scc[0]->configure_channels(153600, 153600, 153600, 153600);
+	m_scc[0]->out_dtrb_callback().set(FUNC(ews4800_state::kbd_dtr_w));
+	m_scc[0]->out_int_callback().set(FUNC(ews4800_state::kbd_int_w));
+	m_scc[1]->configure_channels(153600, 153600, 153600, 153600);
+
+	/*
+	 * Serial ports.  The ROM's console service (0xbfc37db0, reached through
+	 * the extended jump-table entry 0xbfc0ff90) drives SIO-A at 0xbe440008,
+	 * i.e. scc[1] channel A -- that is where the disk boot's serial console
+	 * output goes.
+	 */
+	rs232_port_device &rs232a(RS232_PORT(config, "rs232a", default_rs232_devices, "terminal"));
+	rs232_port_device &rs232b(RS232_PORT(config, "rs232b", default_rs232_devices, nullptr));
+	m_scc[1]->out_txda_callback().set(rs232a, FUNC(rs232_port_device::write_txd));
+	m_scc[1]->out_dtra_callback().set(rs232a, FUNC(rs232_port_device::write_dtr));
+	m_scc[1]->out_rtsa_callback().set(rs232a, FUNC(rs232_port_device::write_rts));
+	m_scc[1]->out_txdb_callback().set(rs232b, FUNC(rs232_port_device::write_txd));
+	rs232a.cts_handler().set(m_scc[1], FUNC(z80scc_device::ctsa_w));
+	rs232a.dcd_handler().set(m_scc[1], FUNC(z80scc_device::dcda_w));
+	rs232a.rxd_handler().set(m_scc[1], FUNC(z80scc_device::rxa_w));
+	rs232b.rxd_handler().set(m_scc[1], FUNC(z80scc_device::rxb_w));
+
+	// floppy (device bus slot 2); uPD72065 per NetBSD's TR2 support
+	UPD72065(config, m_fdc, 8'000'000); // TODO: clock unconfirmed
+	FLOPPY_CONNECTOR(config, "fdc:0", ews4800_floppies, "35hd", floppy_image_device::default_mfm_floppy_formats);
+
+	M48T02(config, m_rtc);
+}
+
+static INPUT_PORTS_START(ews4800_310)
+	PORT_START("kbd0")
+	PORT_BIT(0x0001, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_0) PORT_CHAR('0') PORT_CHAR(')')
+	PORT_BIT(0x0002, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_1) PORT_CHAR('1') PORT_CHAR('!')
+	PORT_BIT(0x0004, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_2) PORT_CHAR('2') PORT_CHAR('@')
+	PORT_BIT(0x0008, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_3) PORT_CHAR('3') PORT_CHAR('#')
+	PORT_BIT(0x0010, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_4) PORT_CHAR('4') PORT_CHAR('$')
+	PORT_BIT(0x0020, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_5) PORT_CHAR('5') PORT_CHAR('%')
+	PORT_BIT(0x0040, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_6) PORT_CHAR('6') PORT_CHAR('^')
+	PORT_BIT(0x0080, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_7) PORT_CHAR('7') PORT_CHAR('&')
+	PORT_BIT(0x0100, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_8) PORT_CHAR('8') PORT_CHAR('*')
+	PORT_BIT(0x0200, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_9) PORT_CHAR('9') PORT_CHAR('(')
+	PORT_BIT(0x0400, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_MINUS) PORT_CHAR('-') PORT_CHAR('_')
+	PORT_BIT(0x0800, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_EQUALS) PORT_CHAR('=') PORT_CHAR('+')
+	PORT_BIT(0x1000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_TILDE) PORT_CHAR('^') PORT_CHAR('~')
+	PORT_BIT(0x2000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_QUOTE) PORT_CHAR('\'') PORT_CHAR('"')
+	PORT_BIT(0x4000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_STOP) PORT_CHAR('.') PORT_CHAR('>')
+	PORT_BIT(0x8000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_SLASH) PORT_CHAR('/') PORT_CHAR('?')
+
+	PORT_START("kbd1")
+	PORT_BIT(0x0001, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_OPENBRACE) PORT_CHAR('[') PORT_CHAR('{')
+	PORT_BIT(0x0002, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_A) PORT_CHAR('a') PORT_CHAR('A')
+	PORT_BIT(0x0004, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_B) PORT_CHAR('b') PORT_CHAR('B')
+	PORT_BIT(0x0008, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_C) PORT_CHAR('c') PORT_CHAR('C')
+	PORT_BIT(0x0010, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_D) PORT_CHAR('d') PORT_CHAR('D')
+	PORT_BIT(0x0020, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_E) PORT_CHAR('e') PORT_CHAR('E')
+	PORT_BIT(0x0040, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_F) PORT_CHAR('f') PORT_CHAR('F')
+	PORT_BIT(0x0080, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_G) PORT_CHAR('g') PORT_CHAR('G')
+	PORT_BIT(0x0100, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_H) PORT_CHAR('h') PORT_CHAR('H')
+	PORT_BIT(0x0200, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_I) PORT_CHAR('i') PORT_CHAR('I')
+	PORT_BIT(0x0400, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_J) PORT_CHAR('j') PORT_CHAR('J')
+	PORT_BIT(0x0800, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_K) PORT_CHAR('k') PORT_CHAR('K')
+	PORT_BIT(0x1000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_L) PORT_CHAR('l') PORT_CHAR('L')
+	PORT_BIT(0x2000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_M) PORT_CHAR('m') PORT_CHAR('M')
+	PORT_BIT(0x4000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_N) PORT_CHAR('n') PORT_CHAR('N')
+	PORT_BIT(0x8000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_O) PORT_CHAR('o') PORT_CHAR('O')
+
+	PORT_START("kbd2")
+	PORT_BIT(0x0001, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_P) PORT_CHAR('p') PORT_CHAR('P')
+	PORT_BIT(0x0002, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_Q) PORT_CHAR('q') PORT_CHAR('Q')
+	PORT_BIT(0x0004, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_R) PORT_CHAR('r') PORT_CHAR('R')
+	PORT_BIT(0x0008, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_S) PORT_CHAR('s') PORT_CHAR('S')
+	PORT_BIT(0x0010, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_T) PORT_CHAR('t') PORT_CHAR('T')
+	PORT_BIT(0x0020, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_U) PORT_CHAR('u') PORT_CHAR('U')
+	PORT_BIT(0x0040, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_V) PORT_CHAR('v') PORT_CHAR('V')
+	PORT_BIT(0x0080, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_W) PORT_CHAR('w') PORT_CHAR('W')
+	PORT_BIT(0x0100, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_X) PORT_CHAR('x') PORT_CHAR('X')
+	PORT_BIT(0x0200, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_Y) PORT_CHAR('y') PORT_CHAR('Y')
+	PORT_BIT(0x0400, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_Z) PORT_CHAR('z') PORT_CHAR('Z')
+	PORT_BIT(0x0800, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_CLOSEBRACE) PORT_CHAR(']') PORT_CHAR('}')
+	PORT_BIT(0x1000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_COMMA) PORT_CHAR(',') PORT_CHAR('<')
+	PORT_BIT(0x2000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_BACKSLASH) PORT_CHAR('\\') PORT_CHAR('|')
+	PORT_BIT(0x4000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_COLON) PORT_CHAR(';') PORT_CHAR(':')
+	// Key 0x2f, the JIS key right of /.  bcon_keytabl says it produces NOTHING
+	// unshifted and _ with shift, so slot 0 is a real zero: PORT_CHAR(0) is the
+	// MAME idiom for that (NEC pc8801/pc88va use it for this very key).  Without
+	// it natkeyboard cannot reach the shifted slot and _ is untypable, which
+	// blocks editing /etc/conf where every keyword has one.
+	PORT_BIT(0x8000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_BACKSLASH2) PORT_CHAR(0) PORT_CHAR(0x5f)
+
+	PORT_START("kbd3")
+	PORT_BIT(0x0001, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_F1) PORT_NAME("F1")
+	PORT_BIT(0x0002, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_F2) PORT_NAME("F2")
+	PORT_BIT(0x0004, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_F3) PORT_NAME("F3")
+	PORT_BIT(0x0008, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_F4) PORT_NAME("F4")
+	PORT_BIT(0x0010, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_F5) PORT_NAME("F5")
+	PORT_BIT(0x0020, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_F6) PORT_NAME("F6")
+	PORT_BIT(0x0040, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_F7) PORT_NAME("F7")
+	PORT_BIT(0x0080, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_F8) PORT_NAME("F8")
+	PORT_BIT(0x0100, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_F9) PORT_NAME("F9")
+	PORT_BIT(0x0200, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_F10) PORT_NAME("F10")
+	PORT_BIT(0x0400, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_SPACE) PORT_CHAR(' ')
+
+	PORT_START("kbd4")
+	PORT_BIT(0x0001, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_ENTER) PORT_CHAR(13)
+	PORT_BIT(0x0002, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_ENTER_PAD)
+
+	PORT_START("kbd5")
+	PORT_BIT(0x0001, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_LSHIFT) PORT_CHAR(UCHAR_SHIFT_1)
+	PORT_BIT(0x0002, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_CODE(KEYCODE_LCONTROL) PORT_CHAR(UCHAR_SHIFT_2)
+INPUT_PORTS_END
+
+ROM_START(ews4800_310)
+	ROM_REGION64_BE(0x100000, "eprom", 0)
+	ROM_SYSTEM_BIOS(0, "ews4800_310", "ews4800_310")
+	ROMX_LOAD("g8ppg__0100.a01f2", 0x00000, 0x80000, CRC(a1e25ce7) SHA1(cfc5e2b203bf6018b04980deeee43afa202dea7c), ROM_BIOS(0))
+	ROMX_LOAD("g8ppg__0200.a01f",  0x80000, 0x80000, CRC(d610f20d) SHA1(f8476bf91111b8023ff7984e5e9a8575e48ed5df), ROM_BIOS(0))
+ROM_END
+
+} // anonymous namespace
+
+/*   YEAR   NAME         PARENT  COMPAT  MACHINE      INPUT  CLASS          INIT  COMPANY  FULLNAME       FLAGS */
+COMP(1993,  ews4800_310, 0,      0,      ews4800_310, ews4800_310, ews4800_state, init, "NEC",   "EWS4800/310", MACHINE_NO_SOUND | MACHINE_NOT_WORKING)
