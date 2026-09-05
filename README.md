@@ -42,9 +42,20 @@ rather than a missing setting. See `docs/STATUS.md`.
 
 ## Driving the guest
 
-The driver is used headless, with `-video none`. There is no window to focus and nothing
-to dismiss. Screen contents are read by dumping the frame buffer and converting it to a
-PNG, so the console can be inspected without a display server.
+`pack/run-ubuntu.sh` opens a window and you type at the machine. Two details are not
+obvious and cost a day between them:
+
+- The driver attaches a serial terminal to `rs232a` by default, and that terminal brings
+  its own screen **and its own keyboard**. MAME enables the terminal's keyboard and
+  leaves the machine's console keyboard disabled, so typing reaches a second window and
+  the login prompt never sees a key. `-rs232a null_modem` removes both; an empty slot
+  (`-rs232a ""`) kills MAME instead.
+- `-video soft`, because a virtual machine without 3D acceleration has no OpenGL and MAME
+  exits with `video_init: Initialization failed`.
+
+`--headless` runs it with `-video none`: nothing to focus, nothing to dismiss, and screen
+contents read by dumping the frame buffer to a PNG. That is how the four hour install is
+driven, and how every measurement in this repository was taken.
 
 Keys are fed through a hot channel: write a line into the file named by `EWS_KEYFILE` and
 the guest types it. This matters because the installer asks a question whose frame number

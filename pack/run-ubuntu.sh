@@ -56,20 +56,41 @@ export EWS_FRAMES="${EWS_FRAMES:-150000}"
 export EWS_SHOTS="${EWS_SHOTS:-5000,10000,15000,20000,30000}"
 
 cd "$RUN"
-echo "booting, Console Login: appears around frame 15000, about eight minutes"
+echo "booting, Console Login: appears around frame 15000"
+echo "ten to twenty minutes: the emulation runs at about half speed. F11 shows it."
 
 if [ "$WINDOW" = yes ]; then
     # -video soft, not the default opengl: a virtual machine without 3D acceleration
     # has no OpenGL, and MAME then dies with "video_init: Initialization failed".
     # Software rendering is plenty for a 1280x1024 monochrome console.
     #
-    # MAME shows two screens before it starts. -skip_gameinfo removes the machine
-    # information one. The red warning screen, raised because the driver is marked
-    # MACHINE_NOT_WORKING, has NO option in 0.288: -showusage lists only
-    # -skip_gameinfo and -confirm_quit. Press any key and it goes.
+    # ONE window, and one keyboard. The driver attaches a serial terminal to rs232a by
+    # default, and that terminal brings its own screen AND its own keyboard. MAME
+    # enabled the terminal's keyboard and left the machine's console keyboard disabled,
+    # so typing went to a second green window and the login prompt never saw a key.
+    # A null_modem keeps the port wired (an empty slot kills MAME) and removes both.
+    #
+    # -videodriver x11: XWayland on a Wayland desktop. This is the path on which keys
+    # were seen reaching MAME on a VirtualBox GNOME session.
     #
     # Never fullscreen: -window -nomaximize.
-    echo "a red warning screen comes first: press any key. Then type into the window."
+    #
+    # The red warning screen the MACHINE_NOT_WORKING flag raises is NOT a command line
+    # option in 0.288: it is skip_warnings in ui.ini, and stock MAME honours that only
+    # when the identical warnings were already shown in the last week, tracked in the
+    # machine cfg. Seeding both makes the first run behave like the second.
+    now=$(date +%s)
+    printf '[ui]\nskip_warnings 1\n' > "$EWS_WORK/ui.ini"
+    mkdir -p "$EWS_WORK/cfg"
+    cat > "$EWS_WORK/cfg/ews4800_310.cfg" <<XML
+<?xml version="1.0"?>
+<mameconfig version="10">
+    <system name="ews4800_310">
+        <ui_warnings launched="${now}" warned="${now}" />
+    </system>
+</mameconfig>
+XML
+    echo "type straight into the window. Root has no password."
     exec "$BIN" \
         -rompath "$EWS_WORK/roms" \
         ews4800_310 \
@@ -78,6 +99,7 @@ if [ "$WINDOW" = yes ]; then
         -scsi:1 harddisk -hard "$DISK" \
         -rs232a null_modem \
         -sound none -video soft -window -nomaximize -skip_gameinfo -numscreens 1 \
+        -videodriver "${EWS_VIDEODRIVER:-x11}" \
         -debugger none -debug \
         ${EWS_OSLOG:+-oslog} \
         -autoboot_script "$EWS_WORK/install.lua" -autoboot_delay 0

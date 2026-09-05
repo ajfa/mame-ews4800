@@ -35,7 +35,10 @@ disk, or an emulator already running.
 
 HOW YOU DRIVE IT
 ----------------
-There is no window. The emulator runs with -video none, so nothing needs focus and no
+run-ubuntu.sh opens a window and you type at the machine; --headless is the mode below.
+Ten to twenty minutes to the login prompt, since the emulation runs at about half speed.
+
+With --headless there is no window. The emulator runs with -video none, so nothing needs focus and no
 warning screen has to be dismissed.
 
 Type into the guest by appending a line to the key file:
