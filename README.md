@@ -32,9 +32,18 @@ to shut the guest down without corrupting the disk image.
 Boots to a root shell on the console. X11 does not come up, and the reason is structural
 rather than a missing setting. See `docs/STATUS.md`.
 
+## Using the machine
+
+[`docs/USING-UX4800.md`](docs/USING-UX4800.md) covers the other half: where the media is
+published and what is and is not preserved anywhere online, why the run scripts spoof a
+machine id, logging in, the licence lock on a fresh install and the one `chmod` that opens
+it, two SVR4 habits that look like breakage, the shutdown sequence that leaves the disk
+clean, and the mistakes that cost the most time.
+
 ## Layout
 
     docs/STATUS.md      what works, what does not, and why
+    docs/USING-UX4800.md  using the installed system, and the traps
     patch/              the driver, as a file and as a patch against MAME 0.288
     harness/            scripts that drive the guest without a window
     tools/              analysis tools used to reverse engineer the machine
